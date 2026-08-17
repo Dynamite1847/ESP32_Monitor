@@ -1,0 +1,27 @@
+path = "/Users/dongyu/esp"
+idf_path = "/Users/dongyu/esp/v5.5.5/esp-idf"
+esp_idf_json_path = "/Users/dongyu/.espressif/tools"
+tool_download_folder_name = "/Users/dongyu/.espressif/dist"
+tool_install_folder_name = "/Users/dongyu/.espressif/tools"
+target = ["esp32s3"]
+idf_versions = ["v5.5.5"]
+tools_json_file = "tools/tools.json"
+config_file_save_path = "eim_config.toml"
+non_interactive = true
+wizard_all_questions = false
+mirror = "https://github.com"
+idf_mirror = "https://github.com"
+pypi_mirror = "https://pypi.org/simple"
+recurse_submodules = true
+install_all_prerequisites = true
+skip_prerequisites_check = false
+cleanup = true
+skip_components_download = false
+python_env_folder_name = "python"
+use_local_archive = "/Users/dongyu/Downloads/archive_v5.5.5_macos-aarch64-2.zst"
+activation_script_path_override = "/Users/dongyu/.espressif/tools"
+python_version_override = "python313"
+create_bat_activation_script = false
+
+[idf_features_per_version]
+"v5.5.5" = []

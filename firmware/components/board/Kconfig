@@ -1,0 +1,21 @@
+menu "Desk Console hardware"
+
+    choice DESK_BOARD_PROFILE
+        prompt "Waveshare board profile"
+        default DESK_BOARD_4_3
+
+        config DESK_BOARD_4_3
+            bool "ESP32-S3-Touch-LCD-4.3"
+
+        config DESK_BOARD_4_3_B
+            bool "ESP32-S3-Touch-LCD-4.3B"
+    endchoice
+
+    config DESK_BRINGUP_DISPLAY_ON
+        bool "Keep the display on during hardware bring-up"
+        default y
+        help
+            Keeps the backlight enabled before BLE privacy locking is implemented.
+            Disable this option for privacy-sensitive production builds.
+
+endmenu
