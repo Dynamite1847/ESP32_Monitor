@@ -6,6 +6,11 @@ firmware/build/
 firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
+firmware/.cache/
+
+# Swift Package Manager build artifacts
+macos-helper/.build/
+macos-helper/.swiftpm/
 
 # Local docx QA working directory (render outputs, profiles)
 .docx_qa/
@@ -13,3 +18,15 @@ firmware/sdkconfig.old
 # Python
 __pycache__/
 *.pyc
+
+# Machine-specific ESP-IDF installer paths
+eim_config.local.toml
+
+# Code signing artifacts (never commit certificates or provisioning profiles)
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+
+# Logs
+*.log

@@ -108,3 +108,46 @@ desk_protocol_status_t desk_protocol_decode(
     frame->payload_length = payload_length;
     return DESK_PROTOCOL_OK;
 }
+
+desk_sequence_result_t desk_sequence_window_accept(
+    desk_sequence_window_t *window,
+    uint16_t sequence
+)
+{
+    if (window == NULL) {
+        return DESK_SEQUENCE_TOO_OLD;
+    }
+
+    if (!window->initialized) {
+        window->initialized = true;
+        window->newest_sequence = sequence;
+        window->seen_bitmap = 1U;
+        return DESK_SEQUENCE_ACCEPTED;
+    }
+
+    const uint16_t forward = (uint16_t)(sequence - window->newest_sequence);
+    if (forward != 0 && forward < 0x8000U) {
+        window->seen_bitmap = forward >= DESK_PROTOCOL_SEQUENCE_WINDOW_SIZE
+                                  ? 1U
+                                  : (window->seen_bitmap << forward) | 1U;
+        window->newest_sequence = sequence;
+        return DESK_SEQUENCE_ACCEPTED;
+    }
+
+    if (forward == 0) {
+        return DESK_SEQUENCE_DUPLICATE;
+    }
+
+    const uint16_t age = (uint16_t)(window->newest_sequence - sequence);
+    if (age >= DESK_PROTOCOL_SEQUENCE_WINDOW_SIZE) {
+        return DESK_SEQUENCE_TOO_OLD;
+    }
+
+    const uint32_t mask = 1U << age;
+    if ((window->seen_bitmap & mask) != 0) {
+        return DESK_SEQUENCE_DUPLICATE;
+    }
+
+    window->seen_bitmap |= mask;
+    return DESK_SEQUENCE_ACCEPTED;
+}

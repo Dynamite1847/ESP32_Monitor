@@ -1,12 +1,13 @@
-path = "/Users/dongyu/esp"
-idf_path = "/Users/dongyu/esp/v5.5.5/esp-idf"
-esp_idf_json_path = "/Users/dongyu/.espressif/tools"
-tool_download_folder_name = "/Users/dongyu/.espressif/dist"
-tool_install_folder_name = "/Users/dongyu/.espressif/tools"
+# Copy this file to eim_config.local.toml and replace the placeholder paths.
+path = "/path/to/esp"
+idf_path = "/path/to/esp/v5.5.5/esp-idf"
+esp_idf_json_path = "/path/to/.espressif/tools"
+tool_download_folder_name = "/path/to/.espressif/dist"
+tool_install_folder_name = "/path/to/.espressif/tools"
 target = ["esp32s3"]
 idf_versions = ["v5.5.5"]
 tools_json_file = "tools/tools.json"
-config_file_save_path = "eim_config.toml"
+config_file_save_path = "eim_config.local.toml"
 non_interactive = true
 wizard_all_questions = false
 mirror = "https://github.com"
@@ -18,8 +19,8 @@ skip_prerequisites_check = false
 cleanup = true
 skip_components_download = false
 python_env_folder_name = "python"
-use_local_archive = "/Users/dongyu/Downloads/archive_v5.5.5_macos-aarch64-2.zst"
-activation_script_path_override = "/Users/dongyu/.espressif/tools"
+use_local_archive = "/path/to/archive_v5.5.5_macos-aarch64.zst"
+activation_script_path_override = "/path/to/.espressif/tools"
 python_version_override = "python313"
 create_bat_activation_script = false
 

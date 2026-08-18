@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "desk_board";
 
@@ -21,6 +22,33 @@ enum {
     CH422G_MODE_ADDRESS = 0x24,
     CH422G_OUTPUT_ADDRESS = 0x38,
 };
+
+enum {
+    CH422G_TP_RESET = 1U << 1,
+    CH422G_LCD_BACKLIGHT = 1U << 2,
+    CH422G_LCD_RESET = 1U << 3,
+    CH422G_SD_CHIP_SELECT = 1U << 4,
+    CH422G_USB_SELECT = 1U << 5,
+};
+
+/* Values below reproduce the Waveshare 4.3 and 4.3B reference sequence. */
+#define CH422G_TOUCH_RESET_ASSERT \
+    (CH422G_LCD_BACKLIGHT | CH422G_LCD_RESET | CH422G_USB_SELECT)
+#define CH422G_TOUCH_RESET_RELEASE (CH422G_TOUCH_RESET_ASSERT | CH422G_TP_RESET)
+#define CH422G_BACKLIGHT_ON \
+    (CH422G_TP_RESET | CH422G_LCD_BACKLIGHT | CH422G_LCD_RESET | CH422G_SD_CHIP_SELECT)
+#define CH422G_BACKLIGHT_OFF \
+    (CH422G_TP_RESET | CH422G_LCD_RESET | CH422G_SD_CHIP_SELECT)
+
+/*
+ * esp_lcd_new_panel_io_i2c() uses _Generic to select its legacy-v1 path when
+ * the bus argument is the numeric I2C port type used below. A future migration
+ * to i2c_master_bus_handle_t must update both the driver and panel-IO call.
+ */
+_Static_assert(
+    _Generic((esp_lcd_i2c_bus_handle_t)0, uint32_t: 1, default: 0),
+    "Legacy esp_lcd I2C v1 routing changed; migrate board I2C calls together"
+);
 
 #define LCD_PIXEL_CLOCK_HZ (16 * 1000 * 1000)
 #define LCD_DATA_WIDTH 16
@@ -41,11 +69,22 @@ static const desk_board_profile_t BOARD_PROFILE = {
 };
 #endif
 
+/* CH422G's output register is write-only and shared by the display, touch,
+ * microSD and USB routing. All steady-state changes go through this shadow so
+ * one peripheral cannot overwrite another peripheral's output bit. */
+static uint8_t ch422g_output_shadow = CH422G_BACKLIGHT_OFF;
+static SemaphoreHandle_t ch422g_output_mutex;
+
 static esp_err_t i2c_master_init_once(void)
 {
     static bool initialized = false;
     if (initialized) {
         return ESP_OK;
+    }
+
+    if (ch422g_output_mutex == NULL) {
+        ch422g_output_mutex = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(ch422g_output_mutex != NULL, ESP_ERR_NO_MEM, TAG, "CH422G mutex allocation failed");
     }
 
     const i2c_config_t config = {
@@ -78,8 +117,36 @@ static esp_err_t ch422g_write(uint8_t address, uint8_t value)
     );
 }
 
+static esp_err_t ch422g_output_write(uint8_t value)
+{
+    const esp_err_t result = ch422g_write(CH422G_OUTPUT_ADDRESS, value);
+    if (result == ESP_OK) {
+        ch422g_output_shadow = value;
+    }
+    return result;
+}
+
+static esp_err_t ch422g_output_update(uint8_t set_mask, uint8_t clear_mask)
+{
+    ESP_RETURN_ON_ERROR(i2c_master_init_once(), TAG, "I2C initialization failed");
+    ESP_RETURN_ON_ERROR(ch422g_write(CH422G_MODE_ADDRESS, 0x01), TAG, "CH422G mode configuration failed");
+    ESP_RETURN_ON_FALSE(
+        xSemaphoreTake(ch422g_output_mutex, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS)) == pdTRUE,
+        ESP_ERR_TIMEOUT,
+        TAG,
+        "CH422G output lock timed out"
+    );
+
+    const uint8_t next = (uint8_t)((ch422g_output_shadow | set_mask) & (uint8_t)~clear_mask);
+    const esp_err_t result = ch422g_output_write(next);
+    xSemaphoreGive(ch422g_output_mutex);
+    return result;
+}
+
 static esp_err_t touch_reset(void)
 {
+    /* GPIO4 selects the GT911 I2C address during reset, then remains output-low.
+     * Touch therefore runs in polling mode with int_gpio_num = -1 below. */
     const gpio_config_t touch_gpio_config = {
         .pin_bit_mask = 1ULL << TOUCH_INTERRUPT_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -90,11 +157,19 @@ static esp_err_t touch_reset(void)
     ESP_RETURN_ON_ERROR(gpio_config(&touch_gpio_config), TAG, "Touch interrupt GPIO configuration failed");
 
     ESP_RETURN_ON_ERROR(ch422g_write(CH422G_MODE_ADDRESS, 0x01), TAG, "CH422G mode configuration failed");
-    ESP_RETURN_ON_ERROR(ch422g_write(CH422G_OUTPUT_ADDRESS, 0x2C), TAG, "Touch reset start failed");
+    ESP_RETURN_ON_ERROR(
+        ch422g_output_write(CH422G_TOUCH_RESET_ASSERT),
+        TAG,
+        "Touch reset start failed"
+    );
     esp_rom_delay_us(100 * 1000);
     ESP_RETURN_ON_ERROR(gpio_set_level(TOUCH_INTERRUPT_GPIO, 0), TAG, "Touch address selection failed");
     esp_rom_delay_us(100 * 1000);
-    ESP_RETURN_ON_ERROR(ch422g_write(CH422G_OUTPUT_ADDRESS, 0x2E), TAG, "Touch reset release failed");
+    ESP_RETURN_ON_ERROR(
+        ch422g_output_write(CH422G_TOUCH_RESET_RELEASE),
+        TAG,
+        "Touch reset release failed"
+    );
     esp_rom_delay_us(200 * 1000);
     return ESP_OK;
 }
@@ -170,6 +245,8 @@ esp_err_t desk_board_display_init(
 
     esp_lcd_panel_io_handle_t touch_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t touch_io_config = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
+    /* Required by ESP-IDF's legacy-v1 panel I2C path: the installed port owns
+     * the clock, and any non-zero value is rejected with ESP_ERR_INVALID_ARG. */
     touch_io_config.scl_speed_hz = 0;
     ESP_RETURN_ON_ERROR(
         esp_lcd_new_panel_io_i2c(
@@ -201,17 +278,27 @@ esp_err_t desk_board_display_init(
         TAG,
         "GT911 initialization failed"
     );
+    /* Establish the original steady-state value before independent backlight
+     * and SD updates begin. The app decides when the backlight turns on. */
+    ESP_RETURN_ON_ERROR(
+        ch422g_output_write(CH422G_BACKLIGHT_OFF),
+        TAG,
+        "CH422G steady-state configuration failed"
+    );
     return ESP_OK;
 }
 
 esp_err_t desk_board_backlight_set(bool enabled)
 {
-    ESP_RETURN_ON_ERROR(i2c_master_init_once(), TAG, "I2C initialization failed");
-    ESP_RETURN_ON_ERROR(ch422g_write(CH422G_MODE_ADDRESS, 0x01), TAG, "CH422G mode configuration failed");
-    ESP_RETURN_ON_ERROR(
-        ch422g_write(CH422G_OUTPUT_ADDRESS, enabled ? 0x1E : 0x1A),
-        TAG,
-        "Backlight update failed"
-    );
-    return ESP_OK;
+    return enabled
+               ? ch422g_output_update(CH422G_LCD_BACKLIGHT, 0)
+               : ch422g_output_update(0, CH422G_LCD_BACKLIGHT);
+}
+
+esp_err_t desk_board_sd_select(bool selected)
+{
+    /* The expander output directly drives active-low SD_CS. */
+    return selected
+               ? ch422g_output_update(0, CH422G_SD_CHIP_SELECT)
+               : ch422g_output_update(CH422G_SD_CHIP_SELECT, 0);
 }

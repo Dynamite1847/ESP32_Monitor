@@ -64,9 +64,12 @@ desk_privacy_actions_t desk_privacy_dispatch(
             return DESK_PRIVACY_ACTION_NONE;
 
         case DESK_PRIVACY_EVENT_HEARTBEAT_TIMEOUT:
+        case DESK_PRIVACY_EVENT_MAC_SLEEPING:
+            enter_locked(context);
+            return LOCK_ACTIONS | DESK_PRIVACY_ACTION_DISCONNECT_BLE;
+
         case DESK_PRIVACY_EVENT_BLE_DISCONNECTED:
         case DESK_PRIVACY_EVENT_MAC_LOCKED:
-        case DESK_PRIVACY_EVENT_MAC_SLEEPING:
             enter_locked(context);
             return LOCK_ACTIONS;
 

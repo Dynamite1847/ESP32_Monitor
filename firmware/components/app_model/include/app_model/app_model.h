@@ -42,6 +42,7 @@ typedef enum {
 typedef struct {
     bool wifi_connected;
     int8_t wifi_rssi_dbm;
+    char wifi_ipv4[16];
     bool ble_connected;
     bool mac_authenticated;
 } desk_connection_state_t;
@@ -63,7 +64,7 @@ typedef struct {
 typedef struct {
     bool active;
     desk_alert_level_t level;
-    char title[48];
+    char title[96];
 } desk_weather_alert_t;
 
 typedef struct {
@@ -95,6 +96,7 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    uint32_t sample_sequence;
     uint16_t cpu_x10_percent;
     uint16_t memory_x10_percent;
     uint32_t disk_free_gb;
@@ -104,9 +106,26 @@ typedef struct {
 } desk_system_state_t;
 
 typedef struct {
+    char firmware_version[20];
+    char board_name[32];
+    uint32_t uptime_seconds;
+    uint32_t free_internal_kb;
+    uint32_t largest_internal_block_kb;
+    uint32_t free_psram_kb;
+    bool storage_mounted;
+    int32_t storage_last_error;
+    uint32_t log_written_entries;
+    uint32_t log_dropped_entries;
+} desk_device_state_t;
+
+typedef struct {
     char provider[16];
+    bool usage_available;
+    bool secondary_usage_available;
     uint8_t primary_usage_percent;
     uint8_t secondary_usage_percent;
+    uint16_t primary_window_minutes;
+    uint16_t secondary_window_minutes;
     uint8_t active_task_count;
     desk_ai_task_status_t task_status;
     uint32_t elapsed_seconds;
@@ -141,6 +160,7 @@ typedef struct {
     desk_control_state_t control;
     desk_ai_state_t ai;
     desk_media_state_t media;
+    desk_device_state_t device;
 } desk_app_state_t;
 
 void desk_app_state_init(desk_app_state_t *state);

@@ -1,22 +1,36 @@
 # ESP32-S3 桌面控制台固件
 
-当前为第一次硬件联调前的软件基线，包含：
+当前为显示、触摸、存储降级和蓝牙广播均已通过实机启动验证的软件基线，包含：
 
 - 4.3 和 4.3B 双开发板编译配置
 - 800×480 RGB 屏、GT911 触摸和 CH422G 背光控制
 - LVGL 9 横屏界面骨架
-- 六个日常页面、页面库、底部程序坞和左右滑动
-- 内置 Source Han Sans SC 16px 中文字体
+- 六个日常页面、页面库、设置、设备诊断、底部程序坞和左右滑动
+- 16px 界面字体与完整东亚文字后备字库
 - 页面统一数据模型和用于界面验收的模拟数据
 - 蓝牙逻辑帧、CRC-16 校验和消息编号
+- NimBLE 单连接 GATT 服务、Secure Connections 绑定、绑定密钥 NVS 持久化和逻辑帧分片重组
+- 随机挑战、HMAC-SHA256 应用认证、NVS 共享密钥登记和 30 秒认证上限
 - 启动、认证、心跳、断开与 Mac 锁屏隐私状态机
+- 蓝牙事件驱动的隐私监督任务和启动失败降级
+- 页面状态局部刷新，常规数据变化不重建全页
+- 系统页接收 Mac 的 CPU、内存、磁盘、网络和电量实时数据，并显示 60 秒 CPU/内存趋势
+- 控制页显示当前前台应用，六个快捷键使用安全队列发送给 Mac
+- AI 页接收 Codex/Claude Code 额度窗口和任务数量，断连后立即清除
+- 媒体页接收系统音量并提供六个系统媒体键
+- Wi-Fi Station、NVS 配网、断线重试和阿里云 NTP 对时
+- 证书校验 HTTPS、PSRAM 响应缓冲和全局串行握手
+- 和风天气当前状态、未来 6 小时、今明两天与有效预警
+- 上证、深证官方接口提供六个常见 A 股指数
+- 设备诊断页每 5 秒更新运行时间、内部内存、PSRAM、存储卡和日志状态
+- microSD 自动挂载、异步日志、2MB 轮转和隐私内容替换
 - 无需开发板即可执行的主机侧自动测试
 
 编译：
 
 ```bash
-source '/Users/dongyu/.espressif/tools/activate_idf_v5.5.5.sh'
-cd '/Users/dongyu/ClaudeCode/ESP32/firmware'
+source "${HOME}/.espressif/tools/activate_idf_v5.5.5.sh"
+cd firmware
 idf.py set-target esp32s3
 idf.py build
 ```
@@ -24,16 +38,20 @@ idf.py build
 一键执行主机测试和完整编译：
 
 ```bash
-cd '/Users/dongyu/ClaudeCode/ESP32/firmware'
+cd firmware
 ./scripts/verify-preflight.sh
 ```
 
 此脚本只检查本机代码和构建结果，不连接、不擦除、不烧录开发板。
 
-当前固件镜像约 1.14MB，最小应用分区为 5MB，剩余 78%。完整中文字体是只读数据占用的主要增量，当前容量仍然充足。
+当前固件镜像为 4,847,040 字节；采用两个 6MB OTA 应用分区，剩余 23%，板载 SPIFFS 约 3.9MB。microSD 用于长期日志、截屏和大型资源，应用程序仍运行在板载 Flash 中。
 
 默认配置为当前已在手的 `ESP32-S3-Touch-LCD-4.3`。4.3B 到货后再在 `menuconfig` 中切换开发板并做实机验证。
 
-`DESK_BRINGUP_DISPLAY_ON` 在首次屏幕联调期间默认开启，因此没有蓝牙连接时也会亮屏。蓝牙 GATT 服务接入隐私状态机后，办公室版本必须关闭该选项。
+`DESK_BRINGUP_DISPLAY_ON` 在联调期间默认开启，因此没有蓝牙认证时也会亮屏，并允许首台 Mac 自动登记应用密钥。办公室版本必须在端到端认证通过后关闭该选项，并把首次登记改为设备端人工确认。
+
+microSD 采用板载独立 SPI 总线，日志写入由低优先级任务处理。挂载失败时每 10 秒重试，不会自动格式化卡；日志位于 `/sdcard/desk_console/logs`，截屏和资源目录也会在首次挂载时建立。
+
+天气配置使用和风天气当前坐标 API，需要专用 API Host、API Key 和经纬度。行情无需第三方密钥，数据取自上交所与深交所公开接口。天气与行情任务等待 Wi-Fi 和有效网络时间后启动；交易时段指数每 60 秒刷新，天气每 15 分钟刷新，HTTPS 握手串行执行以控制峰值内存。
 
 协议细节见 [`protocol/BLE协议.md`](../protocol/BLE协议.md)，接板顺序见 [`docs/接板联调清单.md`](../docs/接板联调清单.md)。

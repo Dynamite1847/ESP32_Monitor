@@ -27,6 +27,7 @@ void desk_app_state_load_mock(desk_app_state_t *state)
     state->revision = 1;
     state->connection.wifi_connected = true;
     state->connection.wifi_rssi_dbm = -52;
+    snprintf(state->connection.wifi_ipv4, sizeof(state->connection.wifi_ipv4), "%s", "192.168.1.88");
 
     state->weather.valid = true;
     state->weather.current_c = 26;
@@ -67,6 +68,7 @@ void desk_app_state_load_mock(desk_app_state_t *state)
 
     state->system = (desk_system_state_t){
         .valid = true,
+        .sample_sequence = 1,
         .cpu_x10_percent = 184,
         .memory_x10_percent = 632,
         .disk_free_gb = 412,
@@ -74,20 +76,34 @@ void desk_app_state_load_mock(desk_app_state_t *state)
         .network_down_kbps = 2450,
         .battery_percent = 86,
     };
+    snprintf(state->device.firmware_version, sizeof(state->device.firmware_version), "%s", "0.1.0");
+    snprintf(state->device.board_name, sizeof(state->device.board_name), "%s", "ESP32-S3 4.3");
+    state->device.uptime_seconds = 3723;
+    state->device.free_internal_kb = 168;
+    state->device.largest_internal_block_kb = 92;
+    state->device.free_psram_kb = 5820;
     snprintf(state->control.active_app, sizeof(state->control.active_app), "%s", "Safari");
     state->control.action_count = 6;
 
     state->ai.valid = true;
     snprintf(state->ai.providers[0].provider, sizeof(state->ai.providers[0].provider), "%s", "Codex");
+    state->ai.providers[0].usage_available = true;
+    state->ai.providers[0].secondary_usage_available = true;
     state->ai.providers[0].primary_usage_percent = 72;
     state->ai.providers[0].secondary_usage_percent = 28;
+    state->ai.providers[0].primary_window_minutes = 300;
+    state->ai.providers[0].secondary_window_minutes = 10080;
     state->ai.providers[0].active_task_count = 1;
     state->ai.providers[0].task_status = DESK_AI_RUNNING;
     state->ai.providers[0].elapsed_seconds = 18 * 60 + 42;
 
     snprintf(state->ai.providers[1].provider, sizeof(state->ai.providers[1].provider), "%s", "Claude Code");
+    state->ai.providers[1].usage_available = true;
+    state->ai.providers[1].secondary_usage_available = true;
     state->ai.providers[1].primary_usage_percent = 41;
     state->ai.providers[1].secondary_usage_percent = 63;
+    state->ai.providers[1].primary_window_minutes = 300;
+    state->ai.providers[1].secondary_window_minutes = 10080;
     state->ai.providers[1].task_status = DESK_AI_IDLE;
 
     state->media.valid = true;

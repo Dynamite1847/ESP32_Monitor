@@ -1,7 +1,7 @@
 # ESP32-S3 桌面控制台：蓝牙协议 v1
 
-> 状态：草案，等待实机 BLE 联调  
-> 更新日期：2026-08-16
+> 状态：传输、认证、心跳、系统状态、控制、AI、媒体和联网配置均已实装
+> 更新日期：2026-08-18
 
 ## 1. 设计目标
 
@@ -22,26 +22,40 @@
 
 连接后请求 MTU 247。协议不依赖单包达到 247；MTU 较小时仍可通过分片传输。
 
+当前固件与 Mac 助手已经实现上述服务、特征、加密写入、通知、状态读取和双向分片重组。链路加密成功后仍需通过应用认证，设备才会进入可信活动状态。
+
 ## 3. 安全与配对
 
 ### 3.1 链路层
 
 - 启用 BLE Secure Connections 和绑定。
 - 设备已绑定后关闭新 Mac 配对。
-- 首次配对需要物理按键进入 60 秒配对窗口。
-- 清除绑定需要已认证 Mac 确认，或长按物理按键 10 秒。
+- 联调配置允许首台 Mac 自动配对和登记密钥。
+- 办公室配置需要物理按键或触屏确认开启 60 秒配对窗口；此入口仍待实现。
+- 清除绑定将要求已认证 Mac 确认，或长按物理按键 10 秒；此入口仍待实现。
 
 ### 3.2 应用层
 
 蓝牙链路建立后设备仍保持熄屏，完成以下认证才进入活动状态：
 
-1. Mac 发送 `HELLO`，包含 16 字节客户端随机数。
-2. ESP32 返回 `AUTH_CHALLENGE`，包含 16 字节设备随机数和 8 字节会话编号。
-3. Mac 返回 `AUTH_RESPONSE`，值为 `HMAC-SHA256(共享密钥, 客户端随机数 || 设备随机数 || 会话编号)`。
+1. Mac 发送 `HELLO`，包含认证负载版本、登记请求标志和 16 字节客户端随机数。
+2. ESP32 返回 `AUTH_CHALLENGE`，包含 16 字节设备随机数和 8 字节会话编号。首次登记时还包含一枚 32 字节共享密钥；该消息只允许在加密链路上发送。
+3. Mac 返回 `AUTH_RESPONSE`，值为 `HMAC-SHA256(共享密钥, "desk-console-auth-v1" || 客户端随机数 || 设备随机数 || 会话编号)`。
 4. ESP32 返回 `AUTH_RESULT`。成功后亮屏、启用触摸并进入首页。
 5. Mac 每 2 秒发送心跳，连续 6 秒没有收到有效心跳时立即锁定。
 
 共享密钥在首次安全配对时生成：ESP32 保存在 NVS，macOS 保存在钥匙串。开发阶段不开启会熔断 eFuse 的安全启动或 Flash 加密；最终加固前单独评审和备份，避免开发板因不可逆配置无法恢复。
+
+认证负载采用以下固定格式：
+
+| 消息 | 长度 | 字段 |
+|---|---:|---|
+| `HELLO` | 18 | 版本 1 字节、标志 1 字节、客户端随机数 16 字节 |
+| `AUTH_CHALLENGE` | 26 / 58 | 版本、标志、设备随机数 16 字节、会话编号 8 字节、首次登记密钥可选 32 字节 |
+| `AUTH_RESPONSE` | 34 | 版本、保留字节、HMAC-SHA256 32 字节 |
+| `AUTH_RESULT` | 3 | 版本、结果码、是否完成首次登记 |
+
+结果码 `1` 表示成功；`0` 表示 HMAC 失败；`2` 表示需要首次登记；`3` 表示登记窗口关闭；`4` 表示请求格式无效；`5` 表示密钥保存失败。
 
 ## 4. 逻辑帧
 
@@ -101,6 +115,8 @@ data           逻辑帧片段
 | `0x0202` | `OPEN_APP` | ESP32 → Mac | 激活 Codex、Claude Code 或媒体应用 |
 | `0x0300` | `WIFI_PROVISION` | Mac → ESP32 | 在已认证链路中配置 Wi-Fi |
 | `0x0301` | `WIFI_RESULT` | ESP32 → Mac | Wi-Fi 配置结果 |
+| `0x0310` | `WEATHER_CONFIG` | Mac → ESP32 | 配置和风天气主机、密钥和坐标 |
+| `0x0311` | `WEATHER_CONFIG_RESULT` | ESP32 → Mac | 天气配置结果 |
 
 ## 7. 业务负载
 
@@ -119,29 +135,108 @@ data           逻辑帧片段
 
 `cpu10` 和 `memory10` 是百分比乘 10，避免固件必须解析浮点数。
 
-### 7.2 AI 状态
+### 7.2 控制页布局
+
+```json
+{
+  "activeApp": "Safari",
+  "actionCount": 6
+}
+```
+
+Mac 只在前台应用变化时重新发送。`activeApp` 最多 31 个 UTF-8 字节，`actionCount` 范围为 0–6。
+
+### 7.3 AI 状态
 
 ```json
 {
   "providers": [
-    {"id":"codex","primary":72,"secondary":28,"tasks":1,"status":"running","elapsed":1122},
-    {"id":"claude","primary":41,"secondary":63,"tasks":0,"status":"idle","elapsed":0}
+    {
+      "id":"codex",
+      "usageAvailable":true,
+      "secondaryAvailable":true,
+      "primary":72,
+      "secondary":28,
+      "primaryWindow":300,
+      "secondaryWindow":10080,
+      "tasks":1,
+      "status":"running",
+      "elapsed":1122
+    },
+    {
+      "id":"claude",
+      "usageAvailable":false,
+      "secondaryAvailable":false,
+      "primary":0,
+      "secondary":0,
+      "primaryWindow":0,
+      "secondaryWindow":0,
+      "tasks":0,
+      "status":"idle",
+      "elapsed":0
+    }
   ]
 }
 ```
 
-任务状态只允许：`idle`、`running`、`waiting_permission`、`waiting_input`、`completed`、`failed`。
+百分比表示当前额度窗口的已用比例，窗口长度单位为分钟。任务状态只允许：`idle`、`running`、`waiting_permission`、`waiting_input`、`completed`、`failed`。Mac 助手只发送任务数量和阶段，不发送任务名称、提示词、回答或项目路径。
 
-### 7.3 控制动作
+### 7.4 媒体状态
 
 ```json
 {
-  "actionId": 120,
-  "gesture": "long_press"
+  "valid": true,
+  "playing": false,
+  "titleHidden": false,
+  "volume": 42,
+  "position": 0,
+  "duration": 0,
+  "title": "Mac 当前媒体"
 }
 ```
 
-Mac 助手根据当前前台应用和最新控制布局校验 `actionId`。过期、未认证或序号重复的动作直接拒绝。
+首版使用通用标题和系统音量；播放器元数据接入前不读取歌名。`position` 与 `duration` 为秒，无法读取时均为 0。
+
+### 7.5 控制动作
+
+```json
+{
+  "actionId": 3,
+  "gesture": "tap"
+}
+```
+
+动作编号如下：
+
+| 编号 | 动作 |
+|---:|---|
+| 1–6 | 后退、前进、刷新、新标签、系统截屏、终端 |
+| 7–9 | 上一首、播放/暂停、下一首 |
+| 10–12 | 静音、音量降低、音量升高 |
+
+Mac 助手会校验认证状态、手势和动作范围；过期、未认证或序号重复的动作直接拒绝。前四项需要 macOS 辅助功能权限，未授权时不主动弹出系统提示。
+
+### 7.6 Wi-Fi 配置
+
+```json
+{"ssid":"Office-2.4G","password":"example-password"}
+```
+
+SSID 为 1–32 个 UTF-8 字节。密码允许为空，或为 8–63 个 UTF-8 字节。固件保存配置后开始连接，响应格式为 `{"ok":true,"code":0}`。凭据只允许在链路加密且应用认证成功后传输，日志不记录字段原文。
+
+### 7.7 天气配置
+
+```json
+{
+  "provider":"qweather",
+  "host":"abcxyz.re.qweatherapi.com",
+  "apiKey":"example-key",
+  "longitude":121.4737,
+  "latitude":31.2304
+}
+```
+
+`host` 使用和风天气控制台分配的专用 API Host，不含协议和路径。经纬度采用十进制度。固件保存后立即请求当前天气、未来 6 小时、今明两天和有效预警，响应格式与 Wi-Fi 配置一致。
 
 ## 8. 兼容策略
 

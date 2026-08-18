@@ -35,6 +35,12 @@ esp_err_t desk_board_display_init(
 
 esp_err_t desk_board_backlight_set(bool enabled);
 
+/**
+ * Selects the onboard microSD card through the CH422G expander. The card uses
+ * a dedicated SPI bus and has no native GPIO chip-select line.
+ */
+esp_err_t desk_board_sd_select(bool selected);
+
 #ifdef __cplusplus
 }
 #endif
