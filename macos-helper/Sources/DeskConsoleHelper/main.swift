@@ -10,7 +10,7 @@ private enum DeskBluetoothUUID {
     static let status = CBUUID(string: "7a1d0004-5d1f-4b42-9e8d-3b2c8c1a4f00")
 }
 
-private enum ConnectionState: Equatable {
+enum ConnectionState: Equatable {
     case starting
     case permissionDenied
     case bluetoothOff
@@ -79,7 +79,7 @@ private enum ConnectionState: Equatable {
     }
 }
 
-private struct DeviceStatus: Equatable {
+struct DeviceStatus: Equatable {
     let protocolVersion: UInt8
     let connected: Bool
     let encrypted: Bool
@@ -168,7 +168,7 @@ private enum DeskWeatherConfigurationError: LocalizedError {
     }
 }
 
-private final class DeskBluetoothController: NSObject {
+final class DeskBluetoothController: NSObject {
     var stateChanged: ((ConnectionState) -> Void)?
     var wifiProvisionCompleted: ((Bool, Int32) -> Void)?
     var weatherConfigurationCompleted: ((Bool, Int32) -> Void)?
@@ -207,6 +207,10 @@ private final class DeskBluetoothController: NSObject {
             stateChanged?(state)
             NSLog("DeskConsoleHelper: %@", state.menuTitle)
         }
+    }
+
+    var currentStateTitle: String {
+        state.menuTitle
     }
 
     override init() {
@@ -398,7 +402,13 @@ private final class DeskBluetoothController: NSObject {
         )
         nextSequence &+= 1
 
-        let writeLength = peripheral.maximumWriteValueLength(for: .withResponse)
+        /* The ESP32 RX path accepts at most one ATT packet of MTU-3 bytes
+         * (244 at MTU 247). macOS may report a larger .withResponse limit
+         * (e.g. 512), which would let a single fragment exceed the device
+         * limit and be rejected with CBATTErrorInvalidAttributeValueLength.
+         * Clamp to the negotiated .withoutResponse value. */
+        let negotiated = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        let writeLength = max(20, min(peripheral.maximumWriteValueLength(for: .withResponse), negotiated))
         let packets = try DeskProtocolCodec.fragment(
             frame: frame,
             frameID: nextFrameID,
@@ -593,6 +603,8 @@ private final class DeskBluetoothController: NSObject {
     }
 
     private func authenticationFailed(_ error: Error) {
+        let details = "\(Date()): authenticationFailed: \(error)\n"
+        try? details.write(toFile: "/tmp/desk-helper-error.log", atomically: true, encoding: .utf8)
         NSLog("DeskConsoleHelper: application authentication failed: %@", error.localizedDescription)
         state = .failed("设备认证失败：\(error.localizedDescription)")
         heartbeatTimer?.invalidate()
@@ -969,6 +981,7 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     private let connectionItem = NSMenuItem(title: "正在启动蓝牙…", action: nil, keyEquivalent: "")
     private var wifiItem: NSMenuItem!
     private var weatherItem: NSMenuItem!
+    private var consoleWindowController: ConsoleWindowController?
     private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -997,6 +1010,15 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         weatherItem.target = self
         weatherItem.isEnabled = false
         menu.addItem(weatherItem)
+        menu.addItem(.separator())
+
+        let consoleItem = NSMenuItem(
+            title: "打开控制台…",
+            action: #selector(showConsole),
+            keyEquivalent: "o"
+        )
+        consoleItem.target = self
+        menu.addItem(consoleItem)
         menu.addItem(.separator())
 
         let reconnectItem = NSMenuItem(
@@ -1071,6 +1093,16 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         accessory.addSubview(passwordField)
         alert.accessoryView = accessory
         alert.window.initialFirstResponder = ssidField
+        /* Pre-fill the last provisioned credentials: the Wi-Fi password does
+         * not change, so retyping it on every configuration is pure friction.
+         * Dev-stage convenience storage (UserDefaults); move to keychain with
+         * a stable signing identity before release. */
+        if let savedSSID = UserDefaults.standard.string(forKey: "desk.wifi.ssid") {
+            ssidField.stringValue = savedSSID
+        }
+        if let savedPassword = UserDefaults.standard.string(forKey: "desk.wifi.password") {
+            passwordField.stringValue = savedPassword
+        }
 
         guard alert.runModal() == .alertFirstButtonReturn else {
             return
@@ -1080,6 +1112,8 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
                 ssid: ssidField.stringValue,
                 password: passwordField.stringValue
             )
+            UserDefaults.standard.set(ssidField.stringValue, forKey: "desk.wifi.ssid")
+            UserDefaults.standard.set(passwordField.stringValue, forKey: "desk.wifi.password")
             wifiItem.title = "正在保存 Wi-Fi…"
             wifiItem.isEnabled = false
         } catch {
@@ -1163,6 +1197,13 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = title
         alert.informativeText = message
         alert.runModal()
+    }
+
+    @objc private func showConsole() {
+        if consoleWindowController == nil {
+            consoleWindowController = ConsoleWindowController(controller: bluetoothController)
+        }
+        consoleWindowController?.showWindowIfNeeded()
     }
 
     @objc private func reconnect() {

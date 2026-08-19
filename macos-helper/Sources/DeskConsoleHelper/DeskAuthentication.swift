@@ -161,11 +161,17 @@ private enum DeskKeychain {
             throw DeskAuthenticationError.keychain(errSecParam)
         }
         try? delete(account: account)
+        /* kSecAttrAccessibleAfterFirstUnlock: readable after first unlock.
+         * NOTE: this item is bound to the code signature of the build that
+         * created it; ad-hoc rebuilds lose access (errSecInteractionNotAllowed
+         * -128). Sign with a stable identity before release, or delete the item
+         * and re-enroll after each rebuild. kSecAttrAccessControl is NOT usable
+         * here: ad-hoc signed apps get errSecMissingEntitlement (-34018). */
         let item: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData as String: key,
         ]
         let status = SecItemAdd(item as CFDictionary, nil)

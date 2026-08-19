@@ -351,7 +351,10 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             link_state.connected = true;
             link_state.encrypted = initially_encrypted;
             link_state.bonded = initially_bonded;
-            link_state.subscribed = false;
+            /* Do NOT reset subscribed here: on a bonded reconnect NimBLE may
+             * dispatch the GATT CCCD subscribe event before the connect-complete
+             * event, so a reset would wipe the fresh subscription and the next
+             * notify would be blocked. DISCONNECT already clears it. */
             link_state.connection_handle = event->connect.conn_handle;
             link_state.mtu = DEFAULT_ATT_MTU;
             taskEXIT_CRITICAL(&link_state.lock);
@@ -583,6 +586,15 @@ esp_err_t desk_ble_link_send_frame(const uint8_t *frame, size_t frame_length)
     can_notify = link_state.connected && link_state.encrypted && link_state.subscribed;
     taskEXIT_CRITICAL(&link_state.lock);
     if (!can_notify || connection_handle == BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW(
+            TAG,
+            "Send blocked: connected=%d encrypted=%d subscribed=%d handle=%u mtu=%u",
+            link_state.connected,
+            link_state.encrypted,
+            link_state.subscribed,
+            link_state.connection_handle,
+            link_state.mtu
+        );
         return ESP_ERR_INVALID_STATE;
     }
 
