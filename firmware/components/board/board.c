@@ -53,7 +53,7 @@ _Static_assert(
 #define LCD_PIXEL_CLOCK_HZ (16 * 1000 * 1000)
 #define LCD_DATA_WIDTH 16
 #define LCD_BITS_PER_PIXEL 16
-#define LCD_BOUNCE_LINES 10
+#define LCD_BOUNCE_LINES 4
 
 #if CONFIG_DESK_BOARD_4_3_B
 static const desk_board_profile_t BOARD_PROFILE = {
