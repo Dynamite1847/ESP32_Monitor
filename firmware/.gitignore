@@ -3,3 +3,5 @@
 /managed_components/
 /sdkconfig
 /sdkconfig.old
+# CJK 后备字库（部署到 SD），由 scripts/generate-ui-font.sh 生成，不入库
+/assets/*.bin

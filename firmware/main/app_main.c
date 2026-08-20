@@ -33,7 +33,9 @@ enum {
     HEARTBEAT_TIMEOUT_MS = 6000,
     APPLICATION_AUTH_TIMEOUT_MS = 30000,
     SUPERVISOR_POLL_MS = 250,
-    SUPERVISOR_STACK_SIZE = 7168,
+    SUPERVISOR_STACK_SIZE = 8192,
+    /* 不可信 payload 的 JSON 最大嵌套层数；正常业务帧不超过 4~5 层。 */
+    JSON_MAX_NESTING_DEPTH = 16,
 };
 
 typedef struct {
@@ -134,7 +136,8 @@ static bool send_protocol_message(
         .payload = payload,
         .payload_length = (uint16_t)payload_length,
     };
-    uint8_t encoded[DESK_PROTOCOL_MAX_FRAME_SIZE];
+    /* 只由单线程 supervisor_task 调用；用静态缓冲避免 524 字节占用任务栈。 */
+    static uint8_t encoded[DESK_PROTOCOL_MAX_FRAME_SIZE];
     size_t encoded_length = 0;
     if (desk_protocol_encode(&frame, encoded, sizeof(encoded), &encoded_length) != DESK_PROTOCOL_OK) {
         return false;
@@ -209,9 +212,49 @@ static bool json_read_u32(
     return true;
 }
 
+/*
+ * 在把不可信 payload 交给 cJSON 前，先扫一遍限制最大嵌套深度。cJSON 按嵌套层数递归，
+ * 512 字节的 payload 可塞进约 250 层 "[[[[…"，会先递归到爆 supervisor 任务栈才触发
+ * cJSON 自己的 1000 层保护。这个 O(n)、感知字符串的预扫把深度钉在业务上限内。
+ */
+static bool json_depth_within_limit(const uint8_t *payload, size_t length, int max_depth)
+{
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = 0; i < length; ++i) {
+        const char character = (char)payload[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (character == '\\') {
+                escaped = true;
+            } else if (character == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (character == '"') {
+            in_string = true;
+        } else if (character == '{' || character == '[') {
+            if (++depth > max_depth) {
+                return false;
+            }
+        } else if (character == '}' || character == ']') {
+            if (depth > 0) {
+                depth--;
+            }
+        }
+    }
+    return true;
+}
+
 static cJSON *parse_json_object(const uint8_t *payload, size_t payload_length)
 {
     if (payload == NULL || payload_length == 0) {
+        return NULL;
+    }
+    if (!json_depth_within_limit(payload, payload_length, JSON_MAX_NESTING_DEPTH)) {
         return NULL;
     }
 
@@ -944,6 +987,37 @@ static void supervisor_task(void *argument)
     }
 }
 
+static void font_loader_task(void *argument)
+{
+    (void)argument;
+    /* CJK 后备字库已移出固件镜像，改由 SD 提供。加载 ~2MB LVGL 二进制字体较慢
+     * （逐字节解析，约几十秒），故放后台低优先级任务、锁外加载，避免阻塞联网与
+     * UI；加载完成后仅在设置 fallback 的一瞬间加 LVGL 锁。 */
+    const char *path = "S:" DESK_STORAGE_ROOT_DIR "/assets/desk_ui_cjk_font_16.bin";
+    bool mounted = false;
+    for (int i = 0; i < 50; ++i) {  /* 最多等 5 秒 SD 挂载 */
+        if (desk_storage_get_status().mounted) {
+            mounted = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!mounted) {
+        ESP_LOGW(TAG, "SD not mounted; CJK fallback unavailable (fixed UI text still renders)");
+        vTaskDelete(NULL);
+        return;
+    }
+    /* 锁外加载：lv_binfont_create 只用堆（CLIB malloc 线程安全）与文件系统，
+     * 构建中的字体对象在接入前是孤立的，不触碰共享 LVGL 状态。 */
+    lv_font_t *cjk = lv_binfont_create(path);
+    if (cjk != NULL && esp_lv_adapter_lock(-1) == ESP_OK) {
+        desk_ui_set_cjk_fallback(cjk);
+        esp_lv_adapter_unlock();
+    }
+    ESP_LOGI(TAG, "CJK fallback font %s (%s)", cjk != NULL ? "loaded" : "load FAILED", path);
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     setenv("TZ", "CST-8", 1);
@@ -952,8 +1026,9 @@ void app_main(void)
     const desk_board_profile_t *profile = desk_board_get_profile();
     ESP_LOGI(TAG, "Board profile: %s", profile->display_name);
 
-    desk_app_state_load_mock(&runtime.app_state);
-    desk_app_state_clear_private(&runtime.app_state);
+    /* 开机不加载 mock：公共数据（天气/行情）初始为 invalid，UI 显示“等待联网更新/
+     * ----”，真实数据到达后替换，避免先闪一屏假数据。私有数据本就随认证前清空。 */
+    desk_app_state_init(&runtime.app_state);
     const esp_app_desc_t *application = esp_app_get_description();
     snprintf(
         runtime.app_state.device.firmware_version,
@@ -1028,7 +1103,16 @@ void app_main(void)
         profile->display_name
     );
 
-    ESP_ERROR_CHECK(nvs_flash_init());
+    xTaskCreate(font_loader_task, "font_load", 6144, NULL, 1, NULL);
+
+    esp_err_t nvs_result = nvs_flash_init();
+    if (nvs_result == ESP_ERR_NVS_NO_FREE_PAGES || nvs_result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        /* 首刷/改分区表/OTA 版本变化时 NVS 需重建，否则 ESP_ERROR_CHECK 会 abort 成重启循环。 */
+        ESP_LOGW(TAG, "NVS needs reformat (%s); erasing", esp_err_to_name(nvs_result));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_result = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_result);
     ESP_ERROR_CHECK(desk_app_auth_init());
     ESP_ERROR_CHECK(desk_http_fetch_init());
 

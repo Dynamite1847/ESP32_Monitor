@@ -782,7 +782,8 @@ static void create_ai_provider(size_t index, int32_t x, const desk_ai_provider_s
 
     char value[64];
     snprintf(value, sizeof(value), "%s", provider->usage_available ? "额度读取中" : "用量接口待接入");
-    lv_obj_t *primary = create_label(content_area, value, &lv_font_montserrat_20, lv_color_hex(0xDCE3EA));
+    // 中文必须用带 CJK fallback 的 desk_ui_font_16；Montserrat 无中文会显示框框。
+    lv_obj_t *primary = create_label(content_area, value, &desk_ui_font_16, lv_color_hex(0xDCE3EA));
     lv_obj_set_pos(primary, x + 28, 92);
     bindings.ai_primary[index] = primary;
     lv_obj_t *primary_bar = lv_bar_create(content_area);
@@ -792,7 +793,7 @@ static void create_ai_provider(size_t index, int32_t x, const desk_ai_provider_s
     bindings.ai_primary_bar[index] = primary_bar;
 
     snprintf(value, sizeof(value), "%s", provider->secondary_usage_available ? "额度读取中" : "无第二额度");
-    lv_obj_t *secondary = create_label(content_area, value, &lv_font_montserrat_18, lv_color_hex(0xA5AFBA));
+    lv_obj_t *secondary = create_label(content_area, value, &desk_ui_font_16, lv_color_hex(0xA5AFBA));
     lv_obj_set_pos(secondary, x + 28, 170);
     bindings.ai_secondary[index] = secondary;
     lv_obj_t *secondary_bar = lv_bar_create(content_area);
@@ -1370,4 +1371,14 @@ void desk_ui_apply_state(const desk_app_state_t *state)
 void desk_ui_show_home(void)
 {
     render_page(PAGE_HOME);
+}
+
+void desk_ui_set_cjk_fallback(lv_font_t *font)
+{
+    desk_ui_font_16.fallback = font;
+    /* 让已创建的中文标签用上新 fallback 重绘。 */
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != NULL) {
+        lv_obj_invalidate(screen);
+    }
 }

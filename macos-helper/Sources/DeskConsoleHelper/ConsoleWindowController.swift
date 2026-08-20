@@ -40,21 +40,14 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         fatalError("init(coder:) is not supported")
     }
 
-    override func windowDidLoad() {
-        super.windowDidLoad()
-        controller.stateChanged = { [weak self] state in
-            DispatchQueue.main.async {
-                self?.statusLabel.stringValue = state.menuTitle
-            }
-        }
-        statusLabel.stringValue = controller.currentStateTitle
-        loadProfiles()
-    }
-
     func showWindowIfNeeded() {
         if window == nil {
             buildWindow()
         }
+        // 每次打开都重新加载配置并刷新列表（避免配置文件在窗口存活期间变化）
+        loadProfiles()
+        profileTable.reloadData()
+        restoreSelection()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -195,18 +188,39 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         weatherSaveButton.frame = NSRect(x: 330, y: y - 28, width: 134, height: 26)
         content.addSubview(weatherSaveButton)
 
-        // 从上次选择恢复
-        if let lastSSID = UserDefaults.standard.string(forKey: Self.lastUsedKey) {
-            if let row = profiles.firstIndex(where: { $0.ssid == lastSSID }) {
-                profileTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        // 天气配置预填：Host/经纬度非敏感存 UserDefaults，API Key 存钥匙串。
+        if let savedHost = UserDefaults.standard.string(forKey: "desk.weather.host") {
+            hostField.stringValue = savedHost
+        }
+        keyField.stringValue = DeskSecretStore.get("weather:key") ?? ""
+        if let savedLon = UserDefaults.standard.string(forKey: "desk.weather.lon") {
+            longitudeField.stringValue = savedLon
+        }
+        if let savedLat = UserDefaults.standard.string(forKey: "desk.weather.lat") {
+            latitudeField.stringValue = savedLat
+        }
+
+        // 状态订阅：observeState 会立即回调一次当前状态，且不会覆盖菜单栏的观察者。
+        controller.observeState { [weak self] state in
+            DispatchQueue.main.async {
+                self?.statusLabel.stringValue = state.menuTitle
             }
         }
+    }
+
+    private func restoreSelection() {
+        guard let lastSSID = UserDefaults.standard.string(forKey: Self.lastUsedKey),
+              let row = profiles.firstIndex(where: { $0.ssid == lastSSID }) else {
+            return
+        }
+        profileTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
     }
 
     // MARK: - 蓝牙操作
 
     @objc private func connectTapped() {
-        controller.start()
+        controller.start()         // 首次启动创建 central；已启动则为空操作
+        controller.reconnectNow()  // 清除 stop() 设的挂起标志并主动重连
     }
 
     @objc private func disconnectTapped() {
@@ -216,15 +230,25 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
     // MARK: - Wi-Fi 操作
 
     private func loadProfiles() {
+        // 新格式：UserDefaults 存 SSID 列表，密码存钥匙串。
+        if let ssids = UserDefaults.standard.stringArray(forKey: Self.profilesKey) {
+            profiles = ssids.map { WiFiProfile(ssid: $0, password: DeskSecretStore.get("wifi:" + $0) ?? "") }
+            return
+        }
+        // 旧格式迁移：曾把 {ssid,password} JSON 明文存在同一 key，迁到钥匙串后按新格式重存。
         if let data = UserDefaults.standard.data(forKey: Self.profilesKey),
            let decoded = try? JSONDecoder().decode([WiFiProfile].self, from: data) {
             profiles = decoded
+            saveProfiles()
+            return
         }
+        profiles = []
     }
 
     private func saveProfiles() {
-        if let data = try? JSONEncoder().encode(profiles) {
-            UserDefaults.standard.set(data, forKey: Self.profilesKey)
+        UserDefaults.standard.set(profiles.map { $0.ssid }, forKey: Self.profilesKey)
+        for profile in profiles {
+            DeskSecretStore.set(profile.password, for: "wifi:" + profile.ssid)
         }
     }
 
@@ -252,7 +276,8 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
     @objc private func removeProfileTapped() {
         let row = profileTable.selectedRow
         guard row >= 0, row < profiles.count else { return }
-        profiles.remove(at: row)
+        let removed = profiles.remove(at: row)
+        DeskSecretStore.delete("wifi:" + removed.ssid)
         saveProfiles()
         profileTable.reloadData()
     }
@@ -267,9 +292,9 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         do {
             try controller.provisionWiFi(ssid: profile.ssid, password: profile.password)
             UserDefaults.standard.set(profile.ssid, forKey: Self.lastUsedKey)
-            // 同步到旧对话框预填
+            // 同步到旧对话框预填：SSID 存 UserDefaults，密码存钥匙串。
             UserDefaults.standard.set(profile.ssid, forKey: "desk.wifi.ssid")
-            UserDefaults.standard.set(profile.password, forKey: "desk.wifi.password")
+            DeskSecretStore.set(profile.password, for: "wifi:" + profile.ssid)
             showMessage(title: "已下发", message: "正在将「\(profile.ssid)」发送给设备…")
         } catch {
             showMessage(title: "下发失败", message: error.localizedDescription)
@@ -288,7 +313,14 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         }
         do {
             try controller.configureWeather(host: host, apiKey: key, longitude: longitude, latitude: latitude)
-            showMessage(title: "已下发", message: "天气配置已发送给设备。")
+            // 配置一次即可：设备侧存入 NVS 永久生效，Mac 侧记住用于预填。
+            // Host/经纬度非敏感存 UserDefaults，API Key 存钥匙串。
+            UserDefaults.standard.set(host, forKey: "desk.weather.host")
+            DeskSecretStore.set(key, for: "weather:key")
+            UserDefaults.standard.removeObject(forKey: "desk.weather.key")  // 清理旧明文
+            UserDefaults.standard.set(longitudeField.stringValue, forKey: "desk.weather.lon")
+            UserDefaults.standard.set(latitudeField.stringValue, forKey: "desk.weather.lat")
+            showMessage(title: "已下发", message: "天气配置已发送给设备，设备会记住并持续更新。")
         } catch {
             showMessage(title: "下发失败", message: error.localizedDescription)
         }

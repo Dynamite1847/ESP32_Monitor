@@ -169,9 +169,17 @@ private enum DeskWeatherConfigurationError: LocalizedError {
 }
 
 final class DeskBluetoothController: NSObject {
-    var stateChanged: ((ConnectionState) -> Void)?
+    private var stateObservers: [(ConnectionState) -> Void] = []
     var wifiProvisionCompleted: ((Bool, Int32) -> Void)?
     var weatherConfigurationCompleted: ((Bool, Int32) -> Void)?
+
+    /// 注册一个状态观察者，并立即用当前状态回调一次。支持多个观察者，使菜单栏状态与
+    /// 控制台窗口可以同时订阅而互不覆盖（此前是单一 stateChanged 回调，打开控制台会
+    /// 覆盖菜单栏的 updateStatus，导致状态图标僵死、菜单项永久变灰）。
+    func observeState(_ observer: @escaping (ConnectionState) -> Void) {
+        stateObservers.append(observer)
+        observer(state)
+    }
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -204,7 +212,9 @@ final class DeskBluetoothController: NSObject {
             guard oldValue != state else {
                 return
             }
-            stateChanged?(state)
+            for observer in stateObservers {
+                observer(state)
+            }
             NSLog("DeskConsoleHelper: %@", state.menuTitle)
         }
     }
@@ -1038,8 +1048,7 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
-        updateStatus(.starting)
-        bluetoothController.stateChanged = { [weak self] state in
+        bluetoothController.observeState { [weak self] state in
             self?.updateStatus(state)
         }
         bluetoothController.wifiProvisionCompleted = { [weak self] succeeded, code in
@@ -1093,15 +1102,10 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         accessory.addSubview(passwordField)
         alert.accessoryView = accessory
         alert.window.initialFirstResponder = ssidField
-        /* Pre-fill the last provisioned credentials: the Wi-Fi password does
-         * not change, so retyping it on every configuration is pure friction.
-         * Dev-stage convenience storage (UserDefaults); move to keychain with
-         * a stable signing identity before release. */
+        /* 预填上次配网凭据：SSID 存 UserDefaults（非敏感），密码存钥匙串。 */
         if let savedSSID = UserDefaults.standard.string(forKey: "desk.wifi.ssid") {
             ssidField.stringValue = savedSSID
-        }
-        if let savedPassword = UserDefaults.standard.string(forKey: "desk.wifi.password") {
-            passwordField.stringValue = savedPassword
+            passwordField.stringValue = DeskSecretStore.get("wifi:" + savedSSID) ?? ""
         }
 
         guard alert.runModal() == .alertFirstButtonReturn else {
@@ -1113,7 +1117,8 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
                 password: passwordField.stringValue
             )
             UserDefaults.standard.set(ssidField.stringValue, forKey: "desk.wifi.ssid")
-            UserDefaults.standard.set(passwordField.stringValue, forKey: "desk.wifi.password")
+            DeskSecretStore.set(passwordField.stringValue, for: "wifi:" + ssidField.stringValue)
+            UserDefaults.standard.removeObject(forKey: "desk.wifi.password")  // 清理旧明文
             wifiItem.title = "正在保存 Wi-Fi…"
             wifiItem.isEnabled = false
         } catch {

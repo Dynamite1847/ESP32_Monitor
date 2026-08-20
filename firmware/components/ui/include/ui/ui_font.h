@@ -6,8 +6,8 @@
 extern "C" {
 #endif
 
-LV_FONT_DECLARE(desk_ui_font_16);
-LV_FONT_DECLARE(desk_ui_cjk_font_16);
+/* 非 const：CJK 后备字库从 SD 运行时加载后写入 .fallback。 */
+extern lv_font_t desk_ui_font_16;
 
 #ifdef __cplusplus
 }

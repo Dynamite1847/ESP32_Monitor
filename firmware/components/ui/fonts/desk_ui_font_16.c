@@ -5764,19 +5764,13 @@ static lv_font_fmt_txt_dsc_t font_dsc = {
 #endif
 };
 
-extern const lv_font_t desk_ui_cjk_font_16;
-
-
 /*-----------------
  *  PUBLIC FONT
  *----------------*/
 
+/* 非 const：CJK fallback 从 SD 运行时加载后写入 .fallback（见 desk_ui_attach_cjk_fallback）。 */
 /*Initialize a public general font descriptor*/
-#if LVGL_VERSION_MAJOR >= 8
-const lv_font_t desk_ui_font_16 = {
-#else
 lv_font_t desk_ui_font_16 = {
-#endif
     .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /*Function pointer to get glyph's data*/
     .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /*Function pointer to get glyph's bitmap*/
     .line_height = 20,          /*The maximum line height required by the font*/
@@ -5790,7 +5784,7 @@ lv_font_t desk_ui_font_16 = {
 #endif
     .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
 #if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
-    .fallback = &desk_ui_cjk_font_16,
+    .fallback = NULL,  /* 运行时接 SD 上的 CJK 后备字库 */
 #endif
     .user_data = NULL,
 };

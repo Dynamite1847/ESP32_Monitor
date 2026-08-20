@@ -175,6 +175,8 @@ static esp_err_t fetch_and_parse(
     char *json = NULL;
     size_t json_length = 0;
     ESP_RETURN_ON_ERROR(fetch_json(current_configuration, path, &json, &json_length), TAG, "Weather request failed");
+    /* 需核对字段单位时用 esp_log_level_set("desk_weather", ESP_LOG_DEBUG) 打开。 */
+    ESP_LOGD(TAG, "Weather response %u bytes: %.120s", (unsigned)json_length, json != NULL ? json : "(null)");
     const bool parsed = parser(json, json_length, state);
     desk_http_response_free(json);
     return parsed ? ESP_OK : ESP_ERR_INVALID_RESPONSE;

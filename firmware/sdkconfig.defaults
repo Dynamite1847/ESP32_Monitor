@@ -11,7 +11,14 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
-CONFIG_ESP_TASK_WDT_EN=n
+# 任务看门狗：卡死时 panic → 自恢复重启（而非硬挂）。超时给足 10s 覆盖
+# 字体后台加载与 TLS 握手的 CPU 尖峰，避免 idle 短暂饿死误触发。
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 
 # 8 MB octal PSRAM
 CONFIG_SPIRAM=y
@@ -58,9 +65,29 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 
+# mbedTLS heap in PSRAM: a TLS handshake needs ~16 KB in + 4 KB out plus cert
+# structures; keeping it in internal RAM starved the BT controller / Wi-Fi and
+# made create_ssl_handle fail on 4.3B. MUST stay here so a fresh build/clone
+# does not silently regress weather + market TLS.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+
 # Board profile: the 4.3 (non-B) board was retired; 4.3B is the target device.
 CONFIG_DESK_BOARD_4_3_B=y
 # CONFIG_DESK_BOARD_4_3 is not set
+
+# CJK 后备字库外置到 SD：LVGL 用 CLIB malloc 让 ~2.3MB 字体落 PSRAM（内置 64KB 池装不下），
+# 并启用 STDIO 文件系统驱动（盘符 'S'=83）读取 /sdcard 上的 .bin 字体。
+# CONFIG_LV_USE_BUILTIN_MALLOC is not set
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_FS_STDIO=y
+CONFIG_LV_FS_STDIO_LETTER=83
+CONFIG_LV_FS_STDIO_CACHE_SIZE=512
+# 字体加载 OOM 时优雅返回 NULL（回退方块），不因 malloc 断言卡死启动。
+# CONFIG_LV_USE_ASSERT_MALLOC is not set
+# CJK 后备字库为 2bpp 压缩格式（lv_font_conv 默认压缩），必须开启解压，
+# 否则后备字符解不出位图、显示为空白/方块。
+CONFIG_LV_USE_FONT_COMPRESSED=y
 
 # LVGL fonts needed by the first 800x480 UI skeleton
 CONFIG_LV_USE_LOG=y

@@ -7,22 +7,31 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 static const char *TAG = "desk_network";
 
 enum {
     NETWORK_EVENT_QUEUE_LENGTH = 8,
-    MAXIMUM_CONNECT_RETRIES = 5,
+    FAST_RETRY_LIMIT = 5,
+    RECONNECT_BASE_DELAY_MS = 1000,
+    RECONNECT_MAX_DELAY_MS = 60000,
 };
 
+/* state_lock 保护下面这组跨任务共享状态：Wi-Fi 事件任务、esp_timer 任务和
+ * 调用 desk_network_provision 的 supervisor 任务会并发读改写它们。 */
+static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t network_event_queue;
+static esp_timer_handle_t reconnect_timer;
 static bool network_started;
 static bool credentials_available;
 static bool provisioning_disconnect_pending;
-static uint8_t retry_count;
+static bool exhausted_notified;
+static uint32_t retry_count;
 
 static void queue_network_event(const desk_network_event_t *event)
 {
@@ -38,6 +47,49 @@ static bool stored_credentials_available(void)
            configuration.sta.ssid[0] != '\0';
 }
 
+/* 退避序列：1s、2s、4s、8s、16s、32s，之后夹在 60s 上限持续重连，永不放弃。 */
+static uint32_t reconnect_delay_ms(uint32_t attempts)
+{
+    uint32_t delay = RECONNECT_BASE_DELAY_MS;
+    for (uint32_t i = 0; i < attempts && delay < RECONNECT_MAX_DELAY_MS; ++i) {
+        delay *= 2;
+    }
+    return delay > RECONNECT_MAX_DELAY_MS ? RECONNECT_MAX_DELAY_MS : delay;
+}
+
+static void reconnect_timer_callback(void *argument)
+{
+    (void)argument;
+    bool connect;
+    taskENTER_CRITICAL(&state_lock);
+    connect = credentials_available;
+    taskEXIT_CRITICAL(&state_lock);
+    if (connect) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    }
+}
+
+/* 断开后按退避排一次重连。永不永久放弃：快重试次数用尽后按 60s 上限慢重连，
+ * 路由器恢复即自动接回。 */
+static void schedule_reconnect(void)
+{
+    uint32_t attempts;
+    taskENTER_CRITICAL(&state_lock);
+    attempts = retry_count;
+    if (retry_count < UINT32_MAX) {
+        retry_count++;
+    }
+    taskEXIT_CRITICAL(&state_lock);
+
+    if (reconnect_timer == NULL) {
+        return;
+    }
+    esp_timer_stop(reconnect_timer);  /* 幂等：未运行时返回错误，忽略即可 */
+    const uint32_t delay_ms = reconnect_delay_ms(attempts);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(reconnect_timer, (uint64_t)delay_ms * 1000ULL));
+    ESP_LOGI(TAG, "Wi-Fi reconnect in %u ms (attempt %u)", (unsigned)delay_ms, (unsigned)attempts + 1U);
+}
+
 static void network_event_handler(
     void *context,
     esp_event_base_t event_base,
@@ -49,7 +101,11 @@ static void network_event_handler(
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         const desk_network_event_t event = {.type = DESK_NETWORK_EVENT_STARTED, .status = ESP_OK};
         queue_network_event(&event);
-        if (credentials_available) {
+        bool connect;
+        taskENTER_CRITICAL(&state_lock);
+        connect = credentials_available;
+        taskEXIT_CRITICAL(&state_lock);
+        if (connect) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
         }
         return;
@@ -57,25 +113,40 @@ static void network_event_handler(
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *disconnected = event_data;
-        desk_network_event_t event = {
+        const desk_network_event_t event = {
             .type = DESK_NETWORK_EVENT_DISCONNECTED,
             .status = ESP_FAIL,
             .disconnect_reason = disconnected != NULL ? disconnected->reason : 0,
         };
         queue_network_event(&event);
 
-        if (provisioning_disconnect_pending) {
-            provisioning_disconnect_pending = false;
+        bool provisioning;
+        bool have_credentials;
+        uint32_t attempts;
+        bool notify_exhausted = false;
+        taskENTER_CRITICAL(&state_lock);
+        provisioning = provisioning_disconnect_pending;
+        provisioning_disconnect_pending = false;
+        have_credentials = credentials_available;
+        attempts = retry_count;
+        if (have_credentials && !provisioning && attempts >= FAST_RETRY_LIMIT && !exhausted_notified) {
+            exhausted_notified = true;
+            notify_exhausted = true;
+        }
+        taskEXIT_CRITICAL(&state_lock);
+
+        if (provisioning || !have_credentials) {
             return;
         }
-
-        if (credentials_available && retry_count < MAXIMUM_CONNECT_RETRIES) {
-            retry_count++;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
-        } else if (credentials_available) {
-            event.type = DESK_NETWORK_EVENT_RETRY_EXHAUSTED;
-            queue_network_event(&event);
+        if (notify_exhausted) {
+            /* 通知一次“已离线”，UI 转离线态；随后仍按慢节奏持续重连。 */
+            const desk_network_event_t exhausted = {
+                .type = DESK_NETWORK_EVENT_RETRY_EXHAUSTED,
+                .status = ESP_FAIL,
+            };
+            queue_network_event(&exhausted);
         }
+        schedule_reconnect();
         return;
     }
 
@@ -83,7 +154,13 @@ static void network_event_handler(
         const ip_event_got_ip_t *got_ip = event_data;
         wifi_ap_record_t access_point = {0};
         const int8_t rssi = esp_wifi_sta_get_ap_info(&access_point) == ESP_OK ? access_point.rssi : 0;
+        taskENTER_CRITICAL(&state_lock);
         retry_count = 0;
+        exhausted_notified = false;
+        taskEXIT_CRITICAL(&state_lock);
+        if (reconnect_timer != NULL) {
+            esp_timer_stop(reconnect_timer);
+        }
         desk_network_event_t event = {
             .type = DESK_NETWORK_EVENT_CONNECTED,
             .status = ESP_OK,
@@ -153,11 +230,23 @@ esp_err_t desk_network_start(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "Wi-Fi storage setup failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Wi-Fi station mode failed");
 
-    credentials_available = stored_credentials_available();
+    const esp_timer_create_args_t reconnect_args = {
+        .callback = reconnect_timer_callback,
+        .name = "wifi_reconnect",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&reconnect_args, &reconnect_timer), TAG, "Reconnect timer creation failed");
+
+    const bool have_saved = stored_credentials_available();
+    taskENTER_CRITICAL(&state_lock);
+    credentials_available = have_saved;
     retry_count = 0;
+    exhausted_notified = false;
+    provisioning_disconnect_pending = false;
+    taskEXIT_CRITICAL(&state_lock);
+
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
     network_started = true;
-    ESP_LOGI(TAG, "Wi-Fi station started; saved network=%d", credentials_available ? 1 : 0);
+    ESP_LOGI(TAG, "Wi-Fi station started; saved network=%d", have_saved ? 1 : 0);
     return ESP_OK;
 }
 
@@ -180,19 +269,38 @@ esp_err_t desk_network_provision(
     configuration.sta.threshold.authmode = WIFI_AUTH_OPEN;
     configuration.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
+    /* 先置 pending 再断开：esp_wifi_disconnect 会异步触发 DISCONNECTED，晚置标志会漏抑制，
+     * 导致这次配网断开被误当作真实掉线而触发重连风暴。 */
+    taskENTER_CRITICAL(&state_lock);
     credentials_available = false;
-    const esp_err_t disconnect_result = esp_wifi_disconnect();
-    provisioning_disconnect_pending = disconnect_result == ESP_OK;
-    if (disconnect_result != ESP_OK && disconnect_result != ESP_ERR_WIFI_NOT_CONNECT) {
-        ESP_LOGW(TAG, "Wi-Fi disconnect before reconfiguration failed: %s", esp_err_to_name(disconnect_result));
+    provisioning_disconnect_pending = true;
+    taskEXIT_CRITICAL(&state_lock);
+    if (reconnect_timer != NULL) {
+        esp_timer_stop(reconnect_timer);
     }
+
+    const esp_err_t disconnect_result = esp_wifi_disconnect();
+    if (disconnect_result != ESP_OK) {
+        /* 没有真正断开 → 不会有 DISCONNECTED 事件来消费 pending，这里清掉以免滞留。 */
+        taskENTER_CRITICAL(&state_lock);
+        provisioning_disconnect_pending = false;
+        taskEXIT_CRITICAL(&state_lock);
+        if (disconnect_result != ESP_ERR_WIFI_NOT_CONNECT) {
+            ESP_LOGW(TAG, "Wi-Fi disconnect before reconfiguration failed: %s", esp_err_to_name(disconnect_result));
+        }
+    }
+
     ESP_RETURN_ON_ERROR(
         esp_wifi_set_config(WIFI_IF_STA, &configuration),
         TAG,
         "Wi-Fi configuration rejected"
     );
+
+    taskENTER_CRITICAL(&state_lock);
     credentials_available = true;
     retry_count = 0;
+    exhausted_notified = false;
+    taskEXIT_CRITICAL(&state_lock);
     ESP_LOGI(TAG, "Wi-Fi network configuration updated");
     return esp_wifi_connect();
 }
