@@ -511,18 +511,31 @@ final class DeskSystemMetricsSampler {
         guard totalBytes > 0 else {
             return 0
         }
-        let unavailablePages = UInt64(statistics.free_count) + UInt64(statistics.speculative_count)
-        let unavailableBytes = min(totalBytes, unavailablePages * UInt64(pageSize))
-        return clampedX10Percent(Double(totalBytes - unavailableBytes) / Double(totalBytes))
+        // 与「活动监视器」的“已用内存”同口径：App 内存 + 联动(wired) + 压缩内存。
+        // App 内存 = 匿名页(internal) − 可清除页(purgeable)；不把 inactive、文件缓存、
+        // 可清除页算作占用（旧实现按 free+speculative 反推，会把这些都当已用，虚高到 ~98%）。
+        let internalPages = UInt64(statistics.internal_page_count)
+        let purgeablePages = UInt64(statistics.purgeable_count)
+        let appPages = internalPages > purgeablePages ? internalPages - purgeablePages : 0
+        let usedPages = appPages + UInt64(statistics.wire_count) + UInt64(statistics.compressor_page_count)
+        let usedBytes = min(totalBytes, usedPages * UInt64(pageSize))
+        return clampedX10Percent(Double(usedBytes) / Double(totalBytes))
     }
 
     private func sampleDiskFreeGB() -> UInt32 {
+        // 与 Finder 同口径：数据卷的「重要用途可用容量」，含系统可清除(purgeable)空间。
+        // 旧实现用 `/`(只读系统卷) 的 systemFreeSize，不含可清除空间，比 Finder 少十几 GB。
+        let dataVolume = FileManager.default.homeDirectoryForCurrentUser
+        if let values = try? dataVolume.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let importantFree = values.volumeAvailableCapacityForImportantUsage, importantFree > 0 {
+            return UInt32(min(UInt64(importantFree) / 1_000_000_000, UInt64(UInt32.max)))
+        }
+        // 回退：老系统或取值失败时用传统 statfs。
         guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
               let freeBytes = attributes[.systemFreeSize] as? NSNumber else {
             return 0
         }
-        let gigabytes = freeBytes.uint64Value / 1_000_000_000
-        return UInt32(min(gigabytes, UInt64(UInt32.max)))
+        return UInt32(min(freeBytes.uint64Value / 1_000_000_000, UInt64(UInt32.max)))
     }
 
     private func sampleNetworkRates() -> (up: UInt32, down: UInt32) {

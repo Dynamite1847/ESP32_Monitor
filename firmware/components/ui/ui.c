@@ -635,6 +635,25 @@ static void refresh_system_charts(void)
     }
 }
 
+/* 把千比特/秒的速率格式化为带单位的紧凑文本：≥1000 显示 x.x Mbps，否则 x Kbps。 */
+static void format_net_rate(char *buf, size_t size, uint32_t kbps)
+{
+    if (kbps >= 1000U) {
+        snprintf(buf, size, "%lu.%luM", (unsigned long)(kbps / 1000U), (unsigned long)((kbps % 1000U) / 100U));
+    } else {
+        snprintf(buf, size, "%luK", (unsigned long)kbps);
+    }
+}
+
+static void format_network_value(char *buf, size_t size, const desk_system_state_t *system)
+{
+    char down_s[16];
+    char up_s[16];
+    format_net_rate(down_s, sizeof(down_s), system->network_down_kbps);
+    format_net_rate(up_s, sizeof(up_s), system->network_up_kbps);
+    snprintf(buf, size, "%s / %s", down_s, up_s);
+}
+
 static void refresh_system_page(void)
 {
     const desk_system_state_t *system = &app_state.system;
@@ -649,13 +668,7 @@ static void refresh_system_page(void)
     set_label_text(bindings.system_value[1], value);
     snprintf(value, sizeof(value), "%lu GB", (unsigned long)system->disk_free_gb);
     set_label_text(bindings.system_value[2], value);
-    snprintf(
-        value,
-        sizeof(value),
-        "%lu / %lu",
-        (unsigned long)system->network_down_kbps,
-        (unsigned long)system->network_up_kbps
-    );
+    format_network_value(value, sizeof(value), system);
     set_label_text(bindings.system_value[3], value);
     refresh_system_charts();
 }
@@ -676,11 +689,11 @@ static void create_system_page(void)
     snprintf(cpu, sizeof(cpu), "%u.%u%%", system->cpu_x10_percent / 10U, system->cpu_x10_percent % 10U);
     snprintf(memory, sizeof(memory), "%u.%u%%", system->memory_x10_percent / 10U, system->memory_x10_percent % 10U);
     snprintf(disk, sizeof(disk), "%lu GB", (unsigned long)system->disk_free_gb);
-    snprintf(network, sizeof(network), "%lu / %lu", (unsigned long)system->network_down_kbps, (unsigned long)system->network_up_kbps);
+    format_network_value(network, sizeof(network), system);
     bindings.system_value[0] = create_metric_cell(0, 0, "CPU", cpu, "最近 60 秒");
     bindings.system_value[1] = create_metric_cell(1, 0, "内存", memory, "最近 60 秒");
     bindings.system_value[2] = create_metric_cell(0, 1, "磁盘可用", disk, "本机存储");
-    bindings.system_value[3] = create_metric_cell(1, 1, "网络", network, "下行 / 上行");
+    bindings.system_value[3] = create_metric_cell(1, 1, "网络", network, "下行 / 上行 (bps)");
     create_system_chart(0, 0, 0);
     create_system_chart(1, 0, 1);
     refresh_system_page();
