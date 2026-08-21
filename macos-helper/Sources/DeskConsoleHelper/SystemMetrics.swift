@@ -550,9 +550,11 @@ final class DeskSystemMetricsSampler {
         }
 
         let elapsed = counters.sampledAt - previousNetwork.sampledAt
-        let receivedKbps = Double(counters.received - previousNetwork.received) * 8 / 1_000 / elapsed
-        let sentKbps = Double(counters.sent - previousNetwork.sent) * 8 / 1_000 / elapsed
-        return (clampedUInt32(sentKbps), clampedUInt32(receivedKbps))
+        // 字节/秒，与 iStat Menus 默认口径一致。旧实现用 ×8÷1000 换成比特/秒(Kbps)，
+        // 比 iStat 的字节口径大约 8 倍，这就是“网速对不上、差很多”的根因。
+        let receivedBytesPerSec = Double(counters.received - previousNetwork.received) / elapsed
+        let sentBytesPerSec = Double(counters.sent - previousNetwork.sent) / elapsed
+        return (clampedUInt32(sentBytesPerSec), clampedUInt32(receivedBytesPerSec))
     }
 
     private func readNetworkCounters(sampledAt: TimeInterval) -> NetworkCounters {
@@ -573,7 +575,8 @@ final class DeskSystemMetricsSampler {
                interface.ifa_addr?.pointee.sa_family == UInt8(AF_LINK),
                let dataPointer = interface.ifa_data {
                 let name = String(cString: interface.ifa_name)
-                if !name.hasPrefix("awdl") && !name.hasPrefix("llw") && !name.hasPrefix("utun") {
+                if !name.hasPrefix("awdl") && !name.hasPrefix("llw") && !name.hasPrefix("utun")
+                    && !name.hasPrefix("bridge") && !name.hasPrefix("anpi") && !name.hasPrefix("ap") {
                     let data = dataPointer.assumingMemoryBound(to: if_data.self).pointee
                     received &+= UInt64(data.ifi_ibytes)
                     sent &+= UInt64(data.ifi_obytes)

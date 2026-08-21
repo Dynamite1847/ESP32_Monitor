@@ -635,13 +635,20 @@ static void refresh_system_charts(void)
     }
 }
 
-/* 把千比特/秒的速率格式化为带单位的紧凑文本：≥1000 显示 x.x Mbps，否则 x Kbps。 */
-static void format_net_rate(char *buf, size_t size, uint32_t kbps)
+/* 把字节/秒的速率格式化为通用文本（与 iStat Menus 同口径）：
+   ≥1MB/s 显示 x.x MB，≥1KB/s 显示 x.x KB，否则 x B。都是每秒。 */
+static void format_net_rate(char *buf, size_t size, uint32_t bytes_per_sec)
 {
-    if (kbps >= 1000U) {
-        snprintf(buf, size, "%lu.%luM", (unsigned long)(kbps / 1000U), (unsigned long)((kbps % 1000U) / 100U));
+    if (bytes_per_sec >= 1024U * 1024U) {
+        /* 四舍五入到 0.1 MB，与 iStat 显示一致 */
+        uint32_t deci = (uint32_t)(((uint64_t)bytes_per_sec * 10U + (1024U * 1024U) / 2U) / (1024U * 1024U));
+        snprintf(buf, size, "%lu.%luMB", (unsigned long)(deci / 10U), (unsigned long)(deci % 10U));
+    } else if (bytes_per_sec >= 1024U) {
+        /* 四舍五入到 0.1 KB */
+        uint32_t deci = (uint32_t)(((uint64_t)bytes_per_sec * 10U + 512U) / 1024U);
+        snprintf(buf, size, "%lu.%luKB", (unsigned long)(deci / 10U), (unsigned long)(deci % 10U));
     } else {
-        snprintf(buf, size, "%luK", (unsigned long)kbps);
+        snprintf(buf, size, "%luB", (unsigned long)bytes_per_sec);
     }
 }
 
@@ -693,7 +700,7 @@ static void create_system_page(void)
     bindings.system_value[0] = create_metric_cell(0, 0, "CPU", cpu, "最近 60 秒");
     bindings.system_value[1] = create_metric_cell(1, 0, "内存", memory, "最近 60 秒");
     bindings.system_value[2] = create_metric_cell(0, 1, "磁盘可用", disk, "本机存储");
-    bindings.system_value[3] = create_metric_cell(1, 1, "网络", network, "下行 / 上行 (bps)");
+    bindings.system_value[3] = create_metric_cell(1, 1, "网络", network, "下行 / 上行 · 每秒");
     create_system_chart(0, 0, 0);
     create_system_chart(1, 0, 1);
     refresh_system_page();
