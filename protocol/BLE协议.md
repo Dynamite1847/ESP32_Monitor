@@ -1,7 +1,7 @@
 # ESP32-S3 桌面控制台：蓝牙协议 v1
 
-> 状态：传输、认证、心跳、系统状态、控制、AI、媒体和联网配置均已实装
-> 更新日期：2026-08-18
+> 状态：私人数据通道、应用认证、Codex Micro 原生控制、系统状态、媒体和联网配置均已实装
+> 更新日期：2026-08-21
 
 ## 1. 设计目标
 
@@ -24,6 +24,23 @@
 
 当前固件与 Mac 助手已经实现上述服务、特征、加密写入、通知、状态读取和双向分片重组。链路加密成功后仍需通过应用认证，设备才会进入可信活动状态。
 
+### 2.1 Codex Micro 原生 HID 服务
+
+同一蓝牙外设还暴露标准 HID over GATT 服务，设备名称为 `Codex Micro`，设备信息与官方控制器兼容：
+
+| 字段 | 值 |
+|---|---|
+| Manufacturer | `Work Louder` |
+| Vendor ID | `0x303A` |
+| Product ID | `0x8360` |
+| HID Usage Page | `0xFF00` |
+| Report ID | `6` |
+| Input / Output Report | 各 63 字节 |
+
+报告正文第 0 字节为消息类型 `2`，第 1 字节为本片 JSON 长度，随后最多 61 字节 JSON 数据。完整 JSON 以换行符结束，可跨多份报告重组。设备向 Codex 发送按键、任务、方向和旋钮事件；Codex 返回设备状态、六个任务灯状态、灯光配置与当前前台应用信息。
+
+原生 HID 只负责 Codex 控制和任务灯。额度、任务标题、系统状态、媒体以及其他隐私数据仍走私人服务。私人助手完成应用认证前屏幕保持锁定，触摸不会发送原生控制。固件在蓝牙服务表升级时发布 Service Changed，并保持私人服务句柄顺序，降低系统缓存导致的重复配对概率。
+
 ## 3. 安全与配对
 
 ### 3.1 链路层
@@ -44,7 +61,7 @@
 4. ESP32 返回 `AUTH_RESULT`。成功后亮屏、启用触摸并进入首页。
 5. Mac 每 2 秒发送心跳，连续 6 秒没有收到有效心跳时立即锁定。
 
-共享密钥在首次安全配对时生成：ESP32 保存在 NVS，macOS 保存在钥匙串。开发阶段不开启会熔断 eFuse 的安全启动或 Flash 加密；最终加固前单独评审和备份，避免开发板因不可逆配置无法恢复。
+共享密钥在首次安全配对时生成：ESP32 保存在 NVS，macOS 保存在权限为 `0600` 的助手私有文件。助手运行期不访问钥匙串。存储方案迁移时，固件只允许已经完成系统蓝牙绑定的 Mac 登记一次替换密钥，成功后删除迁移标志并关闭入口。开发阶段不开启会熔断 eFuse 的安全启动或 Flash 加密；最终加固前单独评审和备份，避免开发板因不可逆配置无法恢复。
 
 认证负载采用以下固定格式：
 
@@ -108,7 +125,8 @@ data           逻辑帧片段
 | `0x0010` | `DEVICE_STATUS` | ESP32 → Mac | 版本、内存和连接状态 |
 | `0x0100` | `SYSTEM_STATE` | Mac → ESP32 | CPU、内存、磁盘、网络和电量 |
 | `0x0110` | `CONTROL_LAYOUT` | Mac → ESP32 | 当前应用与可用动作 |
-| `0x0120` | `AI_STATE` | Mac → ESP32 | Codex/Claude Code 用量与任务状态 |
+| `0x0120` | `AI_STATE` | Mac → ESP32 | Codex/Claude Code 用量与汇总状态 |
+| `0x0121` | `AI_TASKS` | Mac → ESP32 | 六个 Codex 最近任务的标题与逐项状态 |
 | `0x0130` | `MEDIA_STATE` | Mac → ESP32 | 播放、进度、音量和可选标题 |
 | `0x0200` | `ACTION_TRIGGER` | ESP32 → Mac | 点击或长按动作 |
 | `0x0201` | `SLIDER_UPDATE` | ESP32 → Mac | 音量或亮度等连续值 |
@@ -159,7 +177,10 @@ Mac 只在前台应用变化时重新发送。`activeApp` 最多 31 个 UTF-8 �
       "secondary":28,
       "primaryWindow":300,
       "secondaryWindow":10080,
+      "primaryReset":8400,
+      "secondaryReset":540666,
       "tasks":1,
+      "slots":6,
       "status":"running",
       "elapsed":1122
     },
@@ -171,7 +192,10 @@ Mac 只在前台应用变化时重新发送。`activeApp` 最多 31 个 UTF-8 �
       "secondary":0,
       "primaryWindow":0,
       "secondaryWindow":0,
+      "primaryReset":0,
+      "secondaryReset":0,
       "tasks":0,
+      "slots":0,
       "status":"idle",
       "elapsed":0
     }
@@ -179,23 +203,44 @@ Mac 只在前台应用变化时重新发送。`activeApp` 最多 31 个 UTF-8 �
 }
 ```
 
-百分比表示当前额度窗口的已用比例，窗口长度单位为分钟。任务状态只允许：`idle`、`running`、`waiting_permission`、`waiting_input`、`completed`、`failed`。Mac 助手只发送任务数量和阶段，不发送任务名称、提示词、回答或项目路径。
+百分比表示当前额度窗口的已用比例，窗口长度单位为分钟，`primaryReset` 和 `secondaryReset` 是距离重置的剩余秒数。Mac 助手按窗口长度归一化 Codex 接口结果：`primary` 用于小于 24 小时的短周期窗口，`secondary` 用于周窗口。当账户只返回周额度时，`usageAvailable=false`、`secondaryAvailable=true`。
+
+百分比在协议中保留官方接口的“已用比例”语义；界面换算并显示“剩余比例”。周额度界面把剩余秒数与设备本地时间相加，显示明确刷新日期、时刻和倒计时。
+
+`slots` 是可打开的最近任务或会话入口数，范围为 0–6。任务状态只允许：`idle`、`running`、`waiting_permission`、`waiting_input`、`completed`、`failed`。Claude Code 因使用中转服务，额度字段固定为不可用，只发送本机会话数。
+
+任务标题和逐项状态使用独立的 `AI_TASKS` 消息，避免包含两个提供方的 `AI_STATE` 超过 512 字节：
+
+```json
+{
+  "t": [
+    {"n":"规划 ESP32-S3 智能桌面屏","s":"running"},
+    {"n":"调研研报摘要替代需求","s":"idle"}
+  ]
+}
+```
+
+`n` 最多 36 个 UTF-8 字节，`s` 使用上述状态枚举。设备断连、心跳超时或 Mac 锁屏时会连同其他 AI 私有状态一起清除。提示词、回答、预览、工作目录和项目路径仍不进入协议。
 
 ### 7.4 媒体状态
 
 ```json
 {
   "valid": true,
+  "metadataAvailable": true,
   "playing": false,
   "titleHidden": false,
+  "muted": false,
   "volume": 42,
-  "position": 0,
-  "duration": 0,
-  "title": "Mac 当前媒体"
+  "position": 63,
+  "duration": 245,
+  "title": "媒体标题",
+  "artist": "艺人",
+  "source": "音乐"
 }
 ```
 
-首版使用通用标题和系统音量；播放器元数据接入前不读取歌名。`position` 与 `duration` 为秒，无法读取时均为 0。
+`position` 与 `duration` 以秒为单位；直播流或未知时长使用 0。Mac 端读取当前标题、艺人、播放器、播放状态和系统输出音量，ESP32 在两次元数据采样之间按播放状态平滑推进进度。开启标题隐藏后，标题和艺人原文不会通过蓝牙发送。
 
 ### 7.5 控制动作
 
@@ -213,8 +258,27 @@ Mac 只在前台应用变化时重新发送。`activeApp` 最多 31 个 UTF-8 �
 | 1–6 | 后退、前进、刷新、新标签、系统截屏、终端 |
 | 7–9 | 上一首、播放/暂停、下一首 |
 | 10–12 | 静音、音量降低、音量升高 |
+| 13 | ESP32 本地重新连接 Wi-Fi |
+| 14 | ESP32 本地刷新天气与行情 |
+| 15–16 | ESP32 本地刷新诊断、写入诊断快照 |
+| 17 | 切换媒体标题隐私状态 |
+| 18 | 在 Mac 上打开桌面控制台助手设置窗口 |
+| 19–24 | 打开第 1–6 个 Codex 最近任务 |
+| 25 | 打开 Codex 桌面端 |
+| 26 | 打开 Warp，用于 Claude Code 会话 |
+| 27 | Codex 快速模式 |
+| 28 | Codex 批准，界面要求长按 |
+| 29 | Codex 拒绝，界面要求长按 |
+| 30 | 从当前 Codex 任务续开新对话 |
+| 31–32 | Codex 语音键按下 / 释放 |
+| 33 | Codex 发送 |
+| 34–37 | Codex 上 / 右 / 下 / 左方向 |
+| 38–39 | Codex 旋钮逆时针 / 顺时针 |
+| 40–41 | Codex 旋钮按下 / 释放 |
 
-Mac 助手会校验认证状态、手势和动作范围；过期、未认证或序号重复的动作直接拒绝。前四项需要 macOS 辅助功能权限，未授权时不主动弹出系统提示。
+编号 13–16 只在 ESP32 本地执行，不发送给 Mac。其余动作由 Mac 助手校验认证状态、手势和动作范围；过期、未认证或序号重复的动作直接拒绝。前四项需要 macOS 辅助功能权限，未授权时不主动弹出系统提示。
+
+编号 27–41 在固件内转换为 Codex Micro 原生 HID 事件，不经过私人助手。任务键使用 `AG00`–`AG05`，命令键使用 `ACT06`–`ACT12`，旋钮使用 `ENC_CC`、`ENC_CW` 和 `ENC`。方向事件使用角度 `0`、`0.25`、`0.5`、`0.75` 表示右、下、左、上，并发送按下与释放两帧。批准、拒绝的长按约束由界面层执行。
 
 ### 7.6 Wi-Fi 配置
 

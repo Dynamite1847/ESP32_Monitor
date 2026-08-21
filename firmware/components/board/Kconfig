@@ -13,9 +13,17 @@ menu "Desk Console hardware"
 
     config DESK_BRINGUP_DISPLAY_ON
         bool "Keep the display on during hardware bring-up"
-        default y
+        default n
         help
-            Keeps the backlight enabled before BLE privacy locking is implemented.
-            Disable this option for privacy-sensitive production builds.
+            Keeps the backlight enabled only during initial hardware bring-up.
+            Runtime lock, disconnect, and heartbeat privacy actions remain active.
+
+    config DESK_ALLOW_APP_ENROLLMENT
+        bool "Allow first Mac application enrollment"
+        default n
+        help
+            Opens first-owner enrollment and stale BLE pairing recovery. Enable it
+            only for a controlled first-enrollment or recovery build, then disable
+            it again after the application key has been stored in NVS.
 
 endmenu

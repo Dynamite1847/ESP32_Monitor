@@ -10,6 +10,9 @@
 static const char *TAG = "desk_auth";
 static const char *NVS_NAMESPACE = "desk_auth";
 static const char *NVS_SHARED_KEY = "shared_key";
+static const char *NVS_STORAGE_REVISION = "store_rev";
+static const char *NVS_MIGRATION_ENROLLMENT = "migrate_enroll";
+static const uint32_t STORAGE_REVISION = 4U;
 static const uint8_t HMAC_DOMAIN[] = "desk-console-auth-v1";
 
 enum {
@@ -20,6 +23,7 @@ enum {
 typedef struct {
     bool initialized;
     bool has_shared_key;
+    bool migration_enrollment_pending;
     bool challenge_active;
     bool pending_enrollment;
     nvs_handle_t nvs;
@@ -102,6 +106,41 @@ esp_err_t desk_app_auth_init(void)
         return result;
     }
 
+    uint32_t stored_revision = 0U;
+    result = nvs_get_u32(auth_state.nvs, NVS_STORAGE_REVISION, &stored_revision);
+    if (result == ESP_ERR_NVS_NOT_FOUND || stored_revision < STORAGE_REVISION) {
+        /* Revision 4 rotates the application key once after removing the Mac
+         * FileProtection option that made the local copy unreadable after a
+         * restart. BLE bonding, Wi-Fi and all other NVS namespaces stay intact. */
+        esp_err_t erase_result = nvs_erase_key(auth_state.nvs, NVS_SHARED_KEY);
+        if (erase_result != ESP_OK && erase_result != ESP_ERR_NVS_NOT_FOUND) {
+            return erase_result;
+        }
+        result = nvs_set_u32(auth_state.nvs, NVS_STORAGE_REVISION, STORAGE_REVISION);
+        if (result == ESP_OK) {
+            result = nvs_set_u8(auth_state.nvs, NVS_MIGRATION_ENROLLMENT, 1U);
+        }
+        if (result == ESP_OK) {
+            result = nvs_commit(auth_state.nvs);
+        }
+        if (result != ESP_OK) {
+            return result;
+        }
+        auth_state.migration_enrollment_pending = true;
+        ESP_LOGI(TAG, "Application authentication storage migrated to revision %u", STORAGE_REVISION);
+    } else if (result != ESP_OK) {
+        return result;
+    } else {
+        uint8_t migration_pending = 0U;
+        result = nvs_get_u8(auth_state.nvs, NVS_MIGRATION_ENROLLMENT, &migration_pending);
+        if (result == ESP_ERR_NVS_NOT_FOUND) {
+            result = ESP_OK;
+        } else if (result != ESP_OK) {
+            return result;
+        }
+        auth_state.migration_enrollment_pending = migration_pending == 1U;
+    }
+
     size_t key_length = sizeof(auth_state.shared_key);
     result = nvs_get_blob(auth_state.nvs, NVS_SHARED_KEY, auth_state.shared_key, &key_length);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
@@ -131,6 +170,11 @@ void desk_app_auth_reset_session(void)
 bool desk_app_auth_has_shared_key(void)
 {
     return auth_state.has_shared_key;
+}
+
+bool desk_app_auth_migration_enrollment_pending(void)
+{
+    return auth_state.migration_enrollment_pending;
 }
 
 desk_auth_result_code_t desk_app_auth_begin(
@@ -217,6 +261,9 @@ desk_auth_result_code_t desk_app_auth_verify(
             auth_state.pending_key,
             sizeof(auth_state.pending_key)
         );
+        if (result == ESP_OK && auth_state.migration_enrollment_pending) {
+            result = nvs_erase_key(auth_state.nvs, NVS_MIGRATION_ENROLLMENT);
+        }
         if (result == ESP_OK) {
             result = nvs_commit(auth_state.nvs);
         }
@@ -227,6 +274,7 @@ desk_auth_result_code_t desk_app_auth_verify(
         }
         memcpy(auth_state.shared_key, auth_state.pending_key, sizeof(auth_state.shared_key));
         auth_state.has_shared_key = true;
+        auth_state.migration_enrollment_pending = false;
         if (enrolled != NULL) {
             *enrolled = true;
         }

@@ -29,6 +29,14 @@ typedef struct {
     char ipv4[16];
 } desk_network_event_t;
 
+typedef struct {
+    bool connected;
+    bool credentials_available;
+    uint32_t reconnect_attempts;
+    uint8_t last_disconnect_reason;
+    char ssid[DESK_WIFI_SSID_MAX_BYTES + 1];
+} desk_network_status_t;
+
 /** Starts Wi-Fi station mode and reconnects using credentials retained by ESP-IDF. */
 esp_err_t desk_network_start(void);
 
@@ -42,6 +50,12 @@ esp_err_t desk_network_provision(
     const char *password,
     size_t password_length
 );
+
+/** Immediately retries the saved station configuration. */
+esp_err_t desk_network_reconnect(void);
+
+/** Returns a lock-protected snapshot of connection and retry state. */
+desk_network_status_t desk_network_get_status(void);
 
 /** Receives one public connection-state event. */
 bool desk_network_receive_event(desk_network_event_t *event, uint32_t timeout_ms);

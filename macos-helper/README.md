@@ -1,17 +1,20 @@
 # macOS 桌面控制台助手
 
-助手常驻在 macOS 菜单栏，主动扫描并连接 `Desk Console 4.3`。当前包括：
+助手常驻在 macOS 菜单栏，主动扫描并连接设备广播的 `Codex Micro`，同时使用项目私有服务传输额度、任务标题、媒体和系统状态。当前包括：
 
 - 按专用服务 UUID 扫描，避免误连其他设备。
 - 自动连接并发现写入、事件和状态三条特征。
 - 订阅设备事件和状态，读取协议版本、MTU、加密与绑定状态。
-- 完成随机挑战和 HMAC-SHA256 认证，共享密钥保存在 macOS 钥匙串。
+- 完成随机挑战和 HMAC-SHA256 认证，共享密钥保存在助手私有目录的 `0600` 文件中，启动和重连均不访问 macOS 钥匙串。
 - 认证成功后每 2 秒发送心跳，保持设备处于可信活动状态。
 - 每 2 秒采集 Mac 的 CPU、内存、剩余磁盘、网络速率和电量，同步到系统页。
 - 识别当前前台应用，并执行后退、前进、刷新、新标签、截屏和打开终端。
-- 发送系统媒体状态，执行上一首、播放/暂停、下一首、静音和音量调节。
-- 通过 Codex App Server 只读获取当前额度；通过最近更新的会话文件数量估算运行中任务数，不读取任务正文。
-- 检测 Claude Code 进程数量；可选状态行采集器可接入 5 小时与 7 天额度。
+- 发送真实媒体标题、艺人、播放器、进度、播放状态和系统音量，执行上一首、播放/暂停、下一首、静音和音量调节；标题可在设备设置页隐藏。
+- 响应设备设置页的“Mac 设置”，直接打开助手控制台窗口。
+- 通过 Codex App Server 只读获取额度窗口、准确刷新时间、最近任务标题和逐项状态；周额度通过 7 天窗口自动识别。
+- 检测 Claude Code 本机会话数量；当前使用中转服务，不采集 Claude 额度。
+- 响应 AI 页动作，可打开最近 Codex 任务、Codex 桌面端和 Warp。
+- 设备的 Codex 命令、任务切换、方向和旋钮通过同一蓝牙连接上的原生 HID 服务直达 Codex 桌面端；助手继续负责额度、标题、隐私认证和回退打开任务。
 - 菜单中提供设备 Wi-Fi 与和风天气接口配置，凭据只在已加密且应用认证成功的蓝牙链路上传输。
 - Mac 锁屏、屏幕休眠或整机睡眠时发送锁定命令并断开连接，解锁唤醒后自动恢复。
 - 单次连接超过 10 秒会主动取消；失败后按 1、2、4、8 秒退避，之后每 15 秒重新扫描。
@@ -29,23 +32,13 @@ open .build/桌面控制台助手.app
 
 开发构建使用固定应用标识签名，减少重新编译后重复授权。正式发布时将改用 Apple 开发者签名。
 
+认证密钥、Wi-Fi 密码和天气 API Key 位于 `~/Library/Application Support/com.dongyu.desk-console-helper/`。目录权限为 `0700`，密钥文件权限为 `0600`；旧钥匙串项目不会被读取或自动删除。设备固件只允许已绑定的 Mac 在迁移时登记一次新认证密钥，成功后立即关闭迁移入口。
+
 ## AI 状态来源
 
-Codex 用量通过官方 App Server 的 `account/rateLimits/read` 获取。助手单独启动一个只读连接，不创建任务、不读取任务内容；官方字段说明见 [Codex App Server](https://developers.openai.com/codex/app-server/)。若 Codex 未登录或当前认证方式不提供额度，屏幕会显示用量暂不可读。
+Codex 额度通过官方 App Server 的 `account/rateLimits/read` 获取，最近任务通过 `thread/list` 获取。助手按窗口分钟数识别短周期与周额度，避免依赖 `primary` / `secondary` 的返回顺序。设备显示周额度剩余比例和准确刷新时刻。任务只同步最多 36 个 UTF-8 字节的标题与状态，不同步提示词、回答、预览、工作目录或项目路径。官方字段说明见 [Codex App Server](https://learn.chatgpt.com/docs/app-server)。
 
-Claude Code 的官方状态行输入包含 `rate_limits.five_hour` 和 `rate_limits.seven_day`。项目已提供 [`scripts/capture-claude-status.sh`](scripts/capture-claude-status.sh)，但不会自动修改现有 Claude Code 设置。需要启用时，在 `~/.claude/settings.json` 顶层加入：
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "<仓库绝对路径>/macos-helper/scripts/capture-claude-status.sh",
-    "refreshInterval": 5
-  }
-}
-```
-
-若配置文件已有其他内容，只合并 `statusLine` 字段，不要覆盖整个文件。使用自定义接口时，服务端可能不返回订阅额度；这时任务数量仍可显示，用量保持“接口待接入”。字段来源见 [Claude Code 状态行文档](https://code.claude.com/docs/en/statusline)。
+Claude Code 当前只通过本机进程识别活动会话。屏幕上的入口使用“Claude 会话 1”这类通用名称，点击后聚焦 Warp。精确定位某个会话需要后续接入 Claude Code 生命周期事件，届时仍不传输提示词、回答和项目路径。
 
 ## Wi-Fi 与天气配置
 
@@ -61,7 +54,7 @@ Claude Code 的官方状态行输入包含 `rate_limits.five_hour` 和 `rate_lim
 若 macOS 已保存过开发板的低功耗蓝牙绑定，而开发板端的绑定密钥发生变化，系统日志可能出现连接阻止或“设备已不再与本机配对”。处理方式：
 
 1. 退出菜单栏中的桌面控制台助手。
-2. 打开“系统设置 → 蓝牙”，找到 `Desk Console 4.3`。
+2. 打开“系统设置 → 蓝牙”，找到 `Codex Micro`。
 3. 点击设备右侧的详情按钮，选择“忽略此设备”。
 4. 重新启动助手，等待系统重新建立加密绑定。
 

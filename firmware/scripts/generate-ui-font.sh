@@ -27,19 +27,7 @@ if [[ "${actual_sha256}" != "${FONT_SHA256}" ]]; then
     exit 1
 fi
 
-han_glyphs="$(
-    while IFS= read -r source_file; do
-        rg --no-filename -oP '[\x{3400}-\x{9FFF}]' "${source_file}" || true
-    done < <(
-        rg --files \
-            "${FIRMWARE_DIR}/components/ui" \
-            "${FIRMWARE_DIR}/components/app_model" \
-            -g '*.c' -g '*.h' -g '*.txt' \
-            -g '!desk_ui_font_16.c' -g '!desk_ui_cjk_font_16.c'
-    ) |
-        LC_ALL=C sort -u |
-        tr -d '\n'
-)"
+han_glyphs="$(python3 "${SCRIPT_DIR}/extract-ui-han.py" | tr -d '\n')"
 symbols="${han_glyphs}°·，（）～"
 
 cd "${FIRMWARE_DIR}"

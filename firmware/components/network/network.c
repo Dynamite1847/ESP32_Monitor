@@ -29,9 +29,11 @@ static QueueHandle_t network_event_queue;
 static esp_timer_handle_t reconnect_timer;
 static bool network_started;
 static bool credentials_available;
+static bool station_connected;
 static bool provisioning_disconnect_pending;
 static bool exhausted_notified;
 static uint32_t retry_count;
+static uint8_t last_disconnect_reason;
 
 static void queue_network_event(const desk_network_event_t *event)
 {
@@ -125,6 +127,8 @@ static void network_event_handler(
         uint32_t attempts;
         bool notify_exhausted = false;
         taskENTER_CRITICAL(&state_lock);
+        station_connected = false;
+        last_disconnect_reason = disconnected != NULL ? disconnected->reason : 0;
         provisioning = provisioning_disconnect_pending;
         provisioning_disconnect_pending = false;
         have_credentials = credentials_available;
@@ -155,6 +159,7 @@ static void network_event_handler(
         wifi_ap_record_t access_point = {0};
         const int8_t rssi = esp_wifi_sta_get_ap_info(&access_point) == ESP_OK ? access_point.rssi : 0;
         taskENTER_CRITICAL(&state_lock);
+        station_connected = true;
         retry_count = 0;
         exhausted_notified = false;
         taskEXIT_CRITICAL(&state_lock);
@@ -239,9 +244,11 @@ esp_err_t desk_network_start(void)
     const bool have_saved = stored_credentials_available();
     taskENTER_CRITICAL(&state_lock);
     credentials_available = have_saved;
+    station_connected = false;
     retry_count = 0;
     exhausted_notified = false;
     provisioning_disconnect_pending = false;
+    last_disconnect_reason = 0;
     taskEXIT_CRITICAL(&state_lock);
 
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
@@ -262,6 +269,14 @@ esp_err_t desk_network_provision(
         (password_length > 0 && password_length < 8)) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    wifi_config_t previous_configuration = {0};
+    const bool previous_configuration_read =
+        esp_wifi_get_config(WIFI_IF_STA, &previous_configuration) == ESP_OK;
+    bool previously_available;
+    taskENTER_CRITICAL(&state_lock);
+    previously_available = credentials_available;
+    taskEXIT_CRITICAL(&state_lock);
 
     wifi_config_t configuration = {0};
     memcpy(configuration.sta.ssid, ssid, ssid_length);
@@ -290,11 +305,27 @@ esp_err_t desk_network_provision(
         }
     }
 
-    ESP_RETURN_ON_ERROR(
-        esp_wifi_set_config(WIFI_IF_STA, &configuration),
-        TAG,
-        "Wi-Fi configuration rejected"
-    );
+    const esp_err_t configuration_result = esp_wifi_set_config(WIFI_IF_STA, &configuration);
+    if (configuration_result != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi configuration rejected: %s", esp_err_to_name(configuration_result));
+        if (previous_configuration_read) {
+            const esp_err_t rollback_result =
+                esp_wifi_set_config(WIFI_IF_STA, &previous_configuration);
+            if (rollback_result != ESP_OK) {
+                ESP_LOGE(TAG, "Previous Wi-Fi configuration restore failed: %s", esp_err_to_name(rollback_result));
+            }
+        }
+        taskENTER_CRITICAL(&state_lock);
+        credentials_available = previously_available;
+        provisioning_disconnect_pending = false;
+        retry_count = 0;
+        exhausted_notified = false;
+        taskEXIT_CRITICAL(&state_lock);
+        if (previously_available) {
+            schedule_reconnect();
+        }
+        return configuration_result;
+    }
 
     taskENTER_CRITICAL(&state_lock);
     credentials_available = true;
@@ -302,7 +333,68 @@ esp_err_t desk_network_provision(
     exhausted_notified = false;
     taskEXIT_CRITICAL(&state_lock);
     ESP_LOGI(TAG, "Wi-Fi network configuration updated");
-    return esp_wifi_connect();
+    const esp_err_t connect_result = esp_wifi_connect();
+    if (connect_result != ESP_OK) {
+        ESP_LOGW(TAG, "Immediate Wi-Fi connect failed; background retry scheduled: %s", esp_err_to_name(connect_result));
+        schedule_reconnect();
+    }
+    return connect_result;
+}
+
+esp_err_t desk_network_reconnect(void)
+{
+    if (!network_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool have_credentials;
+    bool connected;
+    taskENTER_CRITICAL(&state_lock);
+    have_credentials = credentials_available;
+    connected = station_connected;
+    retry_count = 0;
+    exhausted_notified = false;
+    taskEXIT_CRITICAL(&state_lock);
+    if (!have_credentials) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (reconnect_timer != NULL) {
+        esp_timer_stop(reconnect_timer);
+    }
+
+    if (connected) {
+        const esp_err_t result = esp_wifi_disconnect();
+        if (result == ESP_OK) {
+            ESP_LOGI(TAG, "Manual Wi-Fi reconnect requested");
+            return ESP_OK;
+        }
+        if (result != ESP_ERR_WIFI_NOT_CONNECT) {
+            return result;
+        }
+    }
+
+    const esp_err_t result = esp_wifi_connect();
+    if (result != ESP_OK) {
+        schedule_reconnect();
+    }
+    return result;
+}
+
+desk_network_status_t desk_network_get_status(void)
+{
+    desk_network_status_t status = {0};
+    taskENTER_CRITICAL(&state_lock);
+    status.connected = station_connected;
+    status.credentials_available = credentials_available;
+    status.reconnect_attempts = retry_count;
+    status.last_disconnect_reason = last_disconnect_reason;
+    taskEXIT_CRITICAL(&state_lock);
+    wifi_config_t configuration = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &configuration) == ESP_OK) {
+        memcpy(status.ssid, configuration.sta.ssid, DESK_WIFI_SSID_MAX_BYTES);
+        status.ssid[DESK_WIFI_SSID_MAX_BYTES] = '\0';
+    }
+    return status;
 }
 
 bool desk_network_receive_event(desk_network_event_t *event, uint32_t timeout_ms)

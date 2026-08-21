@@ -32,7 +32,7 @@ enum ConnectionState: Equatable {
         case .bluetoothOff:
             return "蓝牙已关闭"
         case .scanning:
-            return "正在查找 Desk Console 4.3…"
+            return "正在查找 Codex Micro…"
         case let .connecting(name):
             return "正在连接 \(name)…"
         case .discovering:
@@ -172,6 +172,7 @@ final class DeskBluetoothController: NSObject {
     private var stateObservers: [(ConnectionState) -> Void] = []
     var wifiProvisionCompleted: ((Bool, Int32) -> Void)?
     var weatherConfigurationCompleted: ((Bool, Int32) -> Void)?
+    var openConsoleRequested: (() -> Void)?
 
     /// 注册一个状态观察者，并立即用当前状态回调一次。支持多个观察者，使菜单栏状态与
     /// 控制台窗口可以同时订阅而互不覆盖（此前是单一 stateChanged 回调，打开控制台会
@@ -541,15 +542,33 @@ final class DeskBluetoothController: NSObject {
         case 9:
             sendMediaKey(19)
         case 10:
-            sendMediaKey(7)
+            if !mediaSampler.toggleMute() {
+                sendMediaKey(7)
+            }
         case 11:
-            sendMediaKey(1)
+            if !mediaSampler.adjustVolume(by: -0.0625) {
+                sendMediaKey(1)
+            }
         case 12:
-            sendMediaKey(0)
+            if !mediaSampler.adjustVolume(by: 0.0625) {
+                sendMediaKey(0)
+            }
+        case 17:
+            mediaSampler.toggleTitleVisibility()
+        case 18:
+            openConsoleRequested?()
+        case 19...24:
+            _ = aiStatusMonitor.openCodexTask(slot: Int(request.actionId - 19))
+        case 25:
+            openApplication(at: "/Applications/ChatGPT.app")
+        case 26:
+            openApplication(at: "/Applications/Warp.app")
+        case 42...45:
+            _ = aiStatusMonitor.openClaudeSession(slot: Int(request.actionId - 42))
         default:
             throw DeskProtocolError.invalidFrame
         }
-        if (7...12).contains(request.actionId) {
+        if (7...12).contains(request.actionId) || request.actionId == 17 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.sendMediaState()
             }
@@ -571,6 +590,17 @@ final class DeskBluetoothController: NSObject {
                 data2: -1
             )
             event?.cgEvent?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func openApplication(at path: String) {
+        NSWorkspace.shared.openApplication(
+            at: URL(fileURLWithPath: path),
+            configuration: NSWorkspace.OpenConfiguration()
+        ) { _, error in
+            if let error {
+                NSLog("DeskConsoleHelper: unable to open application at %@: %@", path, error.localizedDescription)
+            }
         }
     }
 
@@ -653,11 +683,15 @@ final class DeskBluetoothController: NSObject {
         sendControlLayout(force: true)
         sendMediaState()
         sendAIState()
+        sendAITasks()
+        sendClaudeTasks()
         systemMetricsTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.sendSystemMetrics()
             self?.sendControlLayout()
             self?.sendMediaState()
             self?.sendAIState()
+            self?.sendAITasks()
+            self?.sendClaudeTasks()
         }
     }
 
@@ -668,6 +702,30 @@ final class DeskBluetoothController: NSObject {
         do {
             let payload = try JSONEncoder().encode(aiStatusMonitor.snapshot())
             try sendMessage(.aiState, payload: payload)
+        } catch {
+            authenticationFailed(error)
+        }
+    }
+
+    private func sendAITasks() {
+        guard authenticator.isAuthenticated else {
+            return
+        }
+        do {
+            let payload = try JSONEncoder().encode(aiStatusMonitor.taskSnapshot())
+            try sendMessage(.aiTasks, payload: payload)
+        } catch {
+            authenticationFailed(error)
+        }
+    }
+
+    private func sendClaudeTasks() {
+        guard authenticator.isAuthenticated else {
+            return
+        }
+        do {
+            let payload = try JSONEncoder().encode(aiStatusMonitor.claudeTaskSnapshot())
+            try sendMessage(.aiClaudeTasks, payload: payload)
         } catch {
             authenticationFailed(error)
         }
@@ -799,7 +857,7 @@ extension DeskBluetoothController: CBCentralManagerDelegate {
         peripheral.delegate = self
         let name = peripheral.name
             ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
-            ?? "Desk Console 4.3"
+            ?? "Codex Micro"
         state = .connecting(name)
         central.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
 
@@ -1057,6 +1115,9 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         bluetoothController.weatherConfigurationCompleted = { [weak self] succeeded, code in
             self?.showWeatherConfigurationResult(succeeded: succeeded, code: code)
         }
+        bluetoothController.openConsoleRequested = { [weak self] in
+            self?.showConsole()
+        }
         bluetoothController.start()
         observeWorkspaceState()
     }
@@ -1102,7 +1163,7 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         accessory.addSubview(passwordField)
         alert.accessoryView = accessory
         alert.window.initialFirstResponder = ssidField
-        /* 预填上次配网凭据：SSID 存 UserDefaults（非敏感），密码存钥匙串。 */
+        /* 预填上次配网凭据：SSID 存 UserDefaults，密码存助手私有文件。 */
         if let savedSSID = UserDefaults.standard.string(forKey: "desk.wifi.ssid") {
             ssidField.stringValue = savedSSID
             passwordField.stringValue = DeskSecretStore.get("wifi:" + savedSSID) ?? ""

@@ -69,17 +69,17 @@ static void apply_ui_state(bool show_home)
     esp_lv_adapter_unlock();
 }
 
+static void show_ui_feedback(const char *message, bool succeeded)
+{
+    if (esp_lv_adapter_lock(-1) != ESP_OK) {
+        return;
+    }
+    desk_ui_show_feedback(message, succeeded);
+    esp_lv_adapter_unlock();
+}
+
 static void apply_privacy_actions(desk_privacy_actions_t actions)
 {
-#if CONFIG_DESK_BRINGUP_DISPLAY_ON
-    const desk_privacy_actions_t bypassed =
-        DESK_PRIVACY_ACTION_BACKLIGHT_OFF | DESK_PRIVACY_ACTION_TOUCH_DISABLE;
-    if ((actions & bypassed) != 0) {
-        ESP_LOGW(TAG, "Bring-up mode bypassed automatic screen-off and touch lock");
-        actions &= ~bypassed;
-    }
-#endif
-
     if ((actions & DESK_PRIVACY_ACTION_BACKLIGHT_OFF) != 0) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(desk_board_backlight_set(false));
     }
@@ -170,10 +170,10 @@ static void queue_ui_action(desk_ui_action_id_t action_id, void *context)
     }
 }
 
-static void send_ui_action(uint16_t action_id)
+static bool send_ui_action(uint16_t action_id)
 {
     if (runtime.privacy.state != DESK_PRIVACY_ACTIVE) {
-        return;
+        return false;
     }
     char payload[48];
     const int payload_length = snprintf(
@@ -182,15 +182,17 @@ static void send_ui_action(uint16_t action_id)
         "{\"actionId\":%u,\"gesture\":\"tap\"}",
         action_id
     );
-    if (payload_length <= 0 || (size_t)payload_length >= sizeof(payload) ||
-        !send_protocol_message(
+    const bool sent = payload_length > 0 && (size_t)payload_length < sizeof(payload) &&
+        send_protocol_message(
             DESK_MESSAGE_ACTION_TRIGGER,
             DESK_FRAME_FLAG_NONE,
             (const uint8_t *)payload,
             (size_t)payload_length
-        )) {
+        );
+    if (!sent) {
         ESP_LOGW(TAG, "Unable to send UI action %u", action_id);
     }
+    return sent;
 }
 
 static bool json_read_u32(
@@ -423,14 +425,20 @@ static bool apply_ai_state_payload(const uint8_t *payload, size_t payload_length
         uint32_t secondary = 0;
         uint32_t primary_window = 0;
         uint32_t secondary_window = 0;
+        uint32_t primary_reset = 0;
+        uint32_t secondary_reset = 0;
         uint32_t tasks = 0;
+        uint32_t slots = 0;
         uint32_t elapsed = 0;
         desk_ai_task_status_t task_status = DESK_AI_IDLE;
         if (!json_read_u32(provider, "primary", 100, &primary) ||
             !json_read_u32(provider, "secondary", 100, &secondary) ||
             !json_read_u32(provider, "primaryWindow", UINT16_MAX, &primary_window) ||
             !json_read_u32(provider, "secondaryWindow", UINT16_MAX, &secondary_window) ||
+            !json_read_u32(provider, "primaryReset", UINT32_MAX, &primary_reset) ||
+            !json_read_u32(provider, "secondaryReset", UINT32_MAX, &secondary_reset) ||
             !json_read_u32(provider, "tasks", 32, &tasks) ||
+            !json_read_u32(provider, "slots", DESK_AI_TASK_SLOT_COUNT, &slots) ||
             !json_read_u32(provider, "elapsed", UINT32_MAX, &elapsed) ||
             !parse_ai_status(status->valuestring, &task_status)) {
             cJSON_Delete(root);
@@ -445,7 +453,10 @@ static bool apply_ai_state_payload(const uint8_t *payload, size_t payload_length
         destination->secondary_usage_percent = (uint8_t)secondary;
         destination->primary_window_minutes = (uint16_t)primary_window;
         destination->secondary_window_minutes = (uint16_t)secondary_window;
+        destination->primary_reset_seconds = primary_reset;
+        destination->secondary_reset_seconds = secondary_reset;
         destination->active_task_count = (uint8_t)tasks;
+        destination->available_task_slots = (uint8_t)slots;
         destination->task_status = task_status;
         destination->elapsed_seconds = elapsed;
         seen[index] = true;
@@ -455,7 +466,102 @@ static bool apply_ai_state_payload(const uint8_t *payload, size_t payload_length
         return false;
     }
 
+    /* ai_state 整体覆盖前，保住任务槽位（它们由独立的 tasks 消息维护）。
+     * codex_tasks 与 claude_tasks 都要保留，否则每 2 秒的 ai_state 会清空槽位、
+     * 与 tasks 消息交替导致 AI 页闪烁。available_task_slots 同理不被 ai_state 覆盖。 */
+    memcpy(state.codex_tasks, runtime.app_state.ai.codex_tasks, sizeof(state.codex_tasks));
+    memcpy(state.claude_tasks, runtime.app_state.ai.claude_tasks, sizeof(state.claude_tasks));
+    state.providers[0].available_task_slots = runtime.app_state.ai.providers[0].available_task_slots;
+    state.providers[1].available_task_slots = runtime.app_state.ai.providers[1].available_task_slots;
     runtime.app_state.ai = state;
+    runtime.app_state.revision++;
+    apply_ui_state(false);
+    return true;
+}
+
+static bool apply_ai_tasks_payload(const uint8_t *payload, size_t payload_length)
+{
+    cJSON *root = parse_json_object(payload, payload_length);
+    const cJSON *tasks = root != NULL ? cJSON_GetObjectItemCaseSensitive(root, "t") : NULL;
+    const int task_count = cJSON_IsArray(tasks) ? cJSON_GetArraySize(tasks) : -1;
+    if (task_count < 0 || task_count > DESK_AI_TASK_SLOT_COUNT) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    desk_ai_task_slot_t parsed[DESK_AI_TASK_SLOT_COUNT] = {0};
+    const cJSON *task = NULL;
+    int index = 0;
+    cJSON_ArrayForEach(task, tasks) {
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(task, "n");
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(task, "s");
+        desk_ai_task_status_t parsed_status = DESK_AI_IDLE;
+        if (!cJSON_IsString(name) || name->valuestring == NULL || name->valuestring[0] == '\0' ||
+            strlen(name->valuestring) >= sizeof(parsed[index].name) ||
+            !cJSON_IsString(status) || status->valuestring == NULL ||
+            !parse_ai_status(status->valuestring, &parsed_status)) {
+            cJSON_Delete(root);
+            return false;
+        }
+        parsed[index].assigned = true;
+        parsed[index].status = parsed_status;
+        snprintf(parsed[index].name, sizeof(parsed[index].name), "%s", name->valuestring);
+        index++;
+    }
+    cJSON_Delete(root);
+
+    memcpy(runtime.app_state.ai.codex_tasks, parsed, sizeof(parsed));
+    runtime.app_state.ai.providers[0].available_task_slots = (uint8_t)task_count;
+    runtime.app_state.revision++;
+    apply_ui_state(false);
+    return true;
+}
+
+/* Claude 会话槽位：与 Codex 任务同格式 {"t":[{"n","s"}]}，写入独立的 claude_tasks，
+ * 不触碰 Codex 路径。名称为项目名，状态为运行中/空闲（隐私红线：不含提示词/内容）。 */
+static bool apply_claude_tasks_payload(const uint8_t *payload, size_t payload_length)
+{
+    cJSON *root = parse_json_object(payload, payload_length);
+    const cJSON *tasks = root != NULL ? cJSON_GetObjectItemCaseSensitive(root, "t") : NULL;
+    const int task_count = cJSON_IsArray(tasks) ? cJSON_GetArraySize(tasks) : -1;
+    if (task_count < 0 || task_count > DESK_AI_TASK_SLOT_COUNT) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    desk_ai_task_slot_t parsed[DESK_AI_TASK_SLOT_COUNT] = {0};
+    const cJSON *task = NULL;
+    int index = 0;
+    cJSON_ArrayForEach(task, tasks) {
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(task, "n");
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(task, "s");
+        const cJSON *detail = cJSON_GetObjectItemCaseSensitive(task, "d");
+        desk_ai_task_status_t parsed_status = DESK_AI_IDLE;
+        if (!cJSON_IsString(name) || name->valuestring == NULL || name->valuestring[0] == '\0' ||
+            strlen(name->valuestring) >= sizeof(parsed[index].name) ||
+            !cJSON_IsString(status) || status->valuestring == NULL ||
+            !parse_ai_status(status->valuestring, &parsed_status)) {
+            cJSON_Delete(root);
+            return false;
+        }
+        parsed[index].assigned = true;
+        parsed[index].status = parsed_status;
+        snprintf(parsed[index].name, sizeof(parsed[index].name), "%s", name->valuestring);
+        if (cJSON_IsString(detail) && detail->valuestring != NULL &&
+            strlen(detail->valuestring) < sizeof(parsed[index].detail)) {
+            snprintf(parsed[index].detail, sizeof(parsed[index].detail), "%s", detail->valuestring);
+        }
+        index++;
+    }
+    cJSON_Delete(root);
+
+    /* 数据未变则不刷新：助手每 2 秒推送一次，无谓重绘会让 Claude 页闪烁。 */
+    if (memcmp(runtime.app_state.ai.claude_tasks, parsed, sizeof(parsed)) == 0 &&
+        runtime.app_state.ai.providers[1].available_task_slots == (uint8_t)task_count) {
+        return true;
+    }
+    memcpy(runtime.app_state.ai.claude_tasks, parsed, sizeof(parsed));
+    runtime.app_state.ai.providers[1].available_task_slots = (uint8_t)task_count;
     runtime.app_state.revision++;
     apply_ui_state(false);
     return true;
@@ -469,17 +575,26 @@ static bool apply_media_state_payload(const uint8_t *payload, size_t payload_len
     }
 
     const cJSON *valid_item = cJSON_GetObjectItemCaseSensitive(root, "valid");
+    const cJSON *metadata_available = cJSON_GetObjectItemCaseSensitive(root, "metadataAvailable");
     const cJSON *playing = cJSON_GetObjectItemCaseSensitive(root, "playing");
     const cJSON *title_hidden = cJSON_GetObjectItemCaseSensitive(root, "titleHidden");
+    const cJSON *muted = cJSON_GetObjectItemCaseSensitive(root, "muted");
     const cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "title");
+    const cJSON *artist = cJSON_GetObjectItemCaseSensitive(root, "artist");
+    const cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "source");
     uint32_t volume = 0;
     uint32_t position = 0;
     uint32_t duration = 0;
     const bool valid =
         cJSON_IsBool(valid_item) && cJSON_IsTrue(valid_item) &&
-        cJSON_IsBool(playing) && cJSON_IsBool(title_hidden) &&
+        cJSON_IsBool(metadata_available) && cJSON_IsBool(playing) &&
+        cJSON_IsBool(title_hidden) && cJSON_IsBool(muted) &&
         cJSON_IsString(title) && title->valuestring != NULL && title->valuestring[0] != '\0' &&
+        cJSON_IsString(artist) && artist->valuestring != NULL &&
+        cJSON_IsString(source) && source->valuestring != NULL && source->valuestring[0] != '\0' &&
         strlen(title->valuestring) < sizeof(runtime.app_state.media.title) &&
+        strlen(artist->valuestring) < sizeof(runtime.app_state.media.artist) &&
+        strlen(source->valuestring) < sizeof(runtime.app_state.media.source) &&
         json_read_u32(root, "volume", 100, &volume) &&
         json_read_u32(root, "position", UINT32_MAX, &position) &&
         json_read_u32(root, "duration", UINT32_MAX, &duration) &&
@@ -487,8 +602,10 @@ static bool apply_media_state_payload(const uint8_t *payload, size_t payload_len
     if (valid) {
         runtime.app_state.media = (desk_media_state_t){
             .valid = true,
+            .metadata_available = cJSON_IsTrue(metadata_available),
             .playing = cJSON_IsTrue(playing),
             .title_hidden = cJSON_IsTrue(title_hidden),
+            .muted = cJSON_IsTrue(muted),
             .volume_percent = (uint8_t)volume,
             .position_seconds = position,
             .duration_seconds = duration,
@@ -498,6 +615,18 @@ static bool apply_media_state_payload(const uint8_t *payload, size_t payload_len
             sizeof(runtime.app_state.media.title),
             "%s",
             title->valuestring
+        );
+        snprintf(
+            runtime.app_state.media.artist,
+            sizeof(runtime.app_state.media.artist),
+            "%s",
+            artist->valuestring
+        );
+        snprintf(
+            runtime.app_state.media.source,
+            sizeof(runtime.app_state.media.source),
+            "%s",
+            source->valuestring
         );
     }
     cJSON_Delete(root);
@@ -664,10 +793,10 @@ static void handle_protocol_frame(const desk_ble_event_t *event)
                 frame.payload,
                 frame.payload_length,
                 event->encrypted,
-#if CONFIG_DESK_BRINGUP_DISPLAY_ON
+#if CONFIG_DESK_ALLOW_APP_ENROLLMENT
                 true,
 #else
-                false,
+                event->bonded && desk_app_auth_migration_enrollment_pending(),
 #endif
                 challenge,
                 sizeof(challenge),
@@ -749,6 +878,22 @@ static void handle_protocol_frame(const desk_ble_event_t *event)
             }
             break;
 
+        case DESK_MESSAGE_AI_CLAUDE_TASKS:
+            if (runtime.privacy.state != DESK_PRIVACY_ACTIVE) {
+                ESP_LOGW(TAG, "Rejected Claude tasks before application authentication");
+            } else if (!apply_claude_tasks_payload(frame.payload, frame.payload_length)) {
+                ESP_LOGW(TAG, "Rejected malformed Claude tasks payload");
+            }
+            break;
+
+        case DESK_MESSAGE_AI_TASKS:
+            if (runtime.privacy.state != DESK_PRIVACY_ACTIVE) {
+                ESP_LOGW(TAG, "Rejected AI tasks before application authentication");
+            } else if (!apply_ai_tasks_payload(frame.payload, frame.payload_length)) {
+                ESP_LOGW(TAG, "Rejected malformed AI tasks payload");
+            }
+            break;
+
         case DESK_MESSAGE_MEDIA_STATE:
             if (runtime.privacy.state != DESK_PRIVACY_ACTIVE) {
                 ESP_LOGW(TAG, "Rejected media state before application authentication");
@@ -812,6 +957,7 @@ static void handle_ble_event(const desk_ble_event_t *event)
             runtime.tx_sequence = 0;
             runtime.app_state.connection.ble_connected = true;
             runtime.app_state.connection.mac_authenticated = false;
+            runtime.app_state.device.ble_bonded = event->bonded;
             runtime.app_state.revision++;
             apply_ui_state(false);
             apply_privacy_actions(
@@ -822,6 +968,8 @@ static void handle_ble_event(const desk_ble_event_t *event)
         case DESK_BLE_EVENT_DISCONNECTED:
             desk_app_auth_reset_session();
             runtime.auth_started_ms = 0;
+            runtime.app_state.device.ble_bonded = false;
+            runtime.app_state.device.ble_mtu = 0;
             apply_privacy_actions(
                 desk_privacy_dispatch(&runtime.privacy, DESK_PRIVACY_EVENT_BLE_DISCONNECTED, now_ms)
             );
@@ -834,6 +982,7 @@ static void handle_ble_event(const desk_ble_event_t *event)
                     desk_privacy_dispatch(&runtime.privacy, DESK_PRIVACY_EVENT_AUTH_FAILED, now_ms)
                 );
             } else {
+                runtime.app_state.device.ble_bonded = event->bonded;
                 ESP_LOGI(TAG, "Encrypted BLE link established; waiting for application authentication");
             }
             break;
@@ -843,11 +992,37 @@ static void handle_ble_event(const desk_ble_event_t *event)
             break;
 
         case DESK_BLE_EVENT_MTU_CHANGED:
+            runtime.app_state.device.ble_mtu = event->mtu;
             ESP_LOGI(TAG, "BLE transport MTU is %u", event->mtu);
             break;
 
         case DESK_BLE_EVENT_SUBSCRIPTION_CHANGED:
-            ESP_LOGI(TAG, "BLE event subscription is %s", event->subscribed ? "enabled" : "disabled");
+            ESP_LOGI(
+                TAG,
+                "BLE subscriptions private=%s codex=%s",
+                event->subscribed ? "enabled" : "disabled",
+                event->codex_subscribed ? "enabled" : "disabled"
+            );
+            break;
+
+        case DESK_BLE_EVENT_CODEX_TASK_STATUS:
+            if (runtime.privacy.state == DESK_PRIVACY_ACTIVE &&
+                event->codex_slot < DESK_AI_TASK_SLOT_COUNT &&
+                runtime.app_state.ai.codex_tasks[event->codex_slot].assigned) {
+                static const desk_ai_task_status_t mapped[] = {
+                    DESK_AI_IDLE,
+                    DESK_AI_IDLE,
+                    DESK_AI_RUNNING,
+                    DESK_AI_COMPLETED,
+                    DESK_AI_WAITING_INPUT,
+                    DESK_AI_FAILED,
+                };
+                if ((size_t)event->codex_status < sizeof(mapped) / sizeof(mapped[0])) {
+                    runtime.app_state.ai.codex_tasks[event->codex_slot].status = mapped[event->codex_status];
+                    runtime.app_state.revision++;
+                    apply_ui_state(false);
+                }
+            }
             break;
 
         case DESK_BLE_EVENT_TRANSPORT_ERROR:
@@ -903,6 +1078,7 @@ static void update_device_diagnostics(uint32_t now_ms)
 {
     desk_device_state_t *device = &runtime.app_state.device;
     const desk_storage_status_t storage = desk_storage_get_status();
+    const desk_network_status_t network = desk_network_get_status();
     device->uptime_seconds = now_ms / 1000U;
     device->free_internal_kb = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024U);
     device->largest_internal_block_kb =
@@ -912,6 +1088,15 @@ static void update_device_diagnostics(uint32_t now_ms)
     device->storage_last_error = storage.last_error;
     device->log_written_entries = storage.written_entries;
     device->log_dropped_entries = storage.dropped_entries;
+    device->log_queued_entries = storage.queued_entries;
+    device->wifi_reconnect_attempts = network.reconnect_attempts;
+    device->wifi_last_disconnect_reason = network.last_disconnect_reason;
+    device->wifi_credentials_available = network.credentials_available;
+    snprintf(device->wifi_ssid, sizeof(device->wifi_ssid), "%s", network.ssid);
+    device->heartbeat_age_ms = runtime.privacy.state == DESK_PRIVACY_ACTIVE &&
+                                       runtime.privacy.last_heartbeat_ms != 0U
+                                   ? now_ms - runtime.privacy.last_heartbeat_ms
+                                   : UINT32_MAX;
     runtime.app_state.revision++;
     apply_ui_state(false);
 }
@@ -940,6 +1125,185 @@ static void handle_market_event(const desk_market_event_t *event)
     }
 }
 
+static bool send_codex_key_tap(const char *key, int8_t agent)
+{
+    if (desk_ble_link_codex_send_key(key, 1, agent) != ESP_OK) {
+        return false;
+    }
+    return desk_ble_link_codex_send_key(key, 0, agent) == ESP_OK;
+}
+
+static bool send_codex_direction(float angle)
+{
+    if (desk_ble_link_codex_send_joystick(angle, 1.0f) != ESP_OK) {
+        return false;
+    }
+    return desk_ble_link_codex_send_joystick(angle, 0.0f) == ESP_OK;
+}
+
+static void handle_ui_action(uint16_t action_id, uint32_t now_ms)
+{
+    if (runtime.privacy.state != DESK_PRIVACY_ACTIVE) {
+        return;
+    }
+
+    switch ((desk_ui_action_id_t)action_id) {
+        case DESK_UI_ACTION_WIFI_RECONNECT: {
+            const esp_err_t result = desk_network_reconnect();
+            desk_storage_log(
+                result == ESP_OK ? DESK_LOG_INFO : DESK_LOG_WARNING,
+                DESK_LOG_CONTENT_PUBLIC,
+                TAG,
+                "Manual Wi-Fi reconnect result=%s",
+                esp_err_to_name(result)
+            );
+            update_device_diagnostics(now_ms);
+            show_ui_feedback(
+                result == ESP_OK ? "正在重新连接 Wi-Fi" :
+                (result == ESP_ERR_NOT_FOUND ? "请先在 Mac 助手中配置 Wi-Fi" : "Wi-Fi 重连失败"),
+                result == ESP_OK
+            );
+            break;
+        }
+        case DESK_UI_ACTION_PUBLIC_REFRESH:
+            if (runtime.app_state.connection.wifi_connected) {
+                desk_weather_request_refresh();
+                desk_market_request_refresh();
+                desk_storage_log(
+                    DESK_LOG_INFO,
+                    DESK_LOG_CONTENT_PUBLIC,
+                    TAG,
+                    "Manual public-data refresh requested"
+                );
+                show_ui_feedback("已请求刷新天气和行情", true);
+            } else {
+                show_ui_feedback("Wi-Fi 离线，暂时无法刷新", false);
+            }
+            break;
+        case DESK_UI_ACTION_DIAGNOSTIC_REFRESH:
+            update_device_diagnostics(now_ms);
+            show_ui_feedback("设备状态已刷新", true);
+            break;
+        case DESK_UI_ACTION_DIAGNOSTIC_SNAPSHOT: {
+            const desk_device_state_t *device = &runtime.app_state.device;
+            const bool recorded = desk_storage_log(
+                    DESK_LOG_INFO,
+                    DESK_LOG_CONTENT_PUBLIC,
+                    "diagnostic",
+                    "snapshot firmware=%s uptime=%lu internal_kb=%lu largest_kb=%lu psram_kb=%lu sd=%u "
+                    "wifi=%u ble=%u authenticated=%u retries=%lu logs_written=%lu logs_dropped=%lu",
+                    device->firmware_version,
+                    (unsigned long)device->uptime_seconds,
+                    (unsigned long)device->free_internal_kb,
+                    (unsigned long)device->largest_internal_block_kb,
+                    (unsigned long)device->free_psram_kb,
+                    device->storage_mounted ? 1U : 0U,
+                    runtime.app_state.connection.wifi_connected ? 1U : 0U,
+                    runtime.app_state.connection.ble_connected ? 1U : 0U,
+                    runtime.app_state.connection.mac_authenticated ? 1U : 0U,
+                    (unsigned long)device->wifi_reconnect_attempts,
+                    (unsigned long)device->log_written_entries,
+                    (unsigned long)device->log_dropped_entries
+                );
+            if (recorded) {
+                runtime.app_state.device.diagnostic_snapshots++;
+            }
+            update_device_diagnostics(now_ms);
+            show_ui_feedback(
+                recorded ? "诊断快照已写入存储卡" : "诊断快照写入失败",
+                recorded
+            );
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_TASK_1:
+        case DESK_UI_ACTION_CODEX_TASK_2:
+        case DESK_UI_ACTION_CODEX_TASK_3:
+        case DESK_UI_ACTION_CODEX_TASK_4:
+        case DESK_UI_ACTION_CODEX_TASK_5:
+        case DESK_UI_ACTION_CODEX_TASK_6: {
+            const uint8_t slot = (uint8_t)(action_id - DESK_UI_ACTION_CODEX_TASK_1);
+            char key[5];
+            snprintf(key, sizeof(key), "AG%02u", slot);
+            const bool native_sent = send_codex_key_tap(key, (int8_t)slot);
+            const bool fallback_sent = native_sent ? false : send_ui_action(action_id);
+            show_ui_feedback(
+                native_sent ? "已切换 Codex 任务；双击可聚焦" :
+                (fallback_sent ? "正在 Mac 中打开 Codex 任务" : "Codex 控制尚未连接"),
+                native_sent || fallback_sent
+            );
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_FAST:
+        case DESK_UI_ACTION_CODEX_APPROVE:
+        case DESK_UI_ACTION_CODEX_DECLINE:
+        case DESK_UI_ACTION_CODEX_CONTINUE:
+        case DESK_UI_ACTION_CODEX_SEND: {
+            const char *key = action_id == DESK_UI_ACTION_CODEX_FAST ? "ACT06" :
+                              action_id == DESK_UI_ACTION_CODEX_APPROVE ? "ACT07" :
+                              action_id == DESK_UI_ACTION_CODEX_DECLINE ? "ACT08" :
+                              action_id == DESK_UI_ACTION_CODEX_CONTINUE ? "ACT09" : "ACT12";
+            const bool sent = send_codex_key_tap(key, -1);
+            show_ui_feedback(sent ? "Codex 命令已发送" : "请先在 Codex 中连接控制设备", sent);
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_MIC_PRESS:
+        case DESK_UI_ACTION_CODEX_MIC_RELEASE: {
+            const uint8_t key_action = action_id == DESK_UI_ACTION_CODEX_MIC_PRESS ? 1U : 0U;
+            const bool sent = desk_ble_link_codex_send_key("ACT10", key_action, -1) == ESP_OK;
+            if (action_id == DESK_UI_ACTION_CODEX_MIC_PRESS) {
+                show_ui_feedback(sent ? "语音键已按下" : "请先在 Codex 中连接控制设备", sent);
+            }
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_UP:
+        case DESK_UI_ACTION_CODEX_RIGHT:
+        case DESK_UI_ACTION_CODEX_DOWN:
+        case DESK_UI_ACTION_CODEX_LEFT: {
+            const float angle = action_id == DESK_UI_ACTION_CODEX_RIGHT ? 0.0f :
+                                action_id == DESK_UI_ACTION_CODEX_DOWN ? 0.25f :
+                                action_id == DESK_UI_ACTION_CODEX_LEFT ? 0.5f : 0.75f;
+            const bool sent = send_codex_direction(angle);
+            show_ui_feedback(sent ? "Codex 导航命令已发送" : "请先在 Codex 中连接控制设备", sent);
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_DIAL_CCW:
+        case DESK_UI_ACTION_CODEX_DIAL_CW: {
+            const char *key = action_id == DESK_UI_ACTION_CODEX_DIAL_CCW ? "ENC_CC" : "ENC_CW";
+            const bool sent = desk_ble_link_codex_send_key(key, 2, -1) == ESP_OK;
+            show_ui_feedback(sent ? "Codex 旋钮命令已发送" : "请先在 Codex 中连接控制设备", sent);
+            break;
+        }
+        case DESK_UI_ACTION_CODEX_DIAL_PRESS:
+        case DESK_UI_ACTION_CODEX_DIAL_RELEASE: {
+            const uint8_t key_action = action_id == DESK_UI_ACTION_CODEX_DIAL_PRESS ? 1U : 0U;
+            const bool sent = desk_ble_link_codex_send_key("ENC", key_action, -1) == ESP_OK;
+            if (action_id == DESK_UI_ACTION_CODEX_DIAL_PRESS && !sent) {
+                show_ui_feedback("请先在 Codex 中连接控制设备", false);
+            }
+            break;
+        }
+        default: {
+            const bool sent = send_ui_action(action_id);
+            if (action_id >= DESK_UI_ACTION_MEDIA_PREVIOUS &&
+                action_id <= DESK_UI_ACTION_MEDIA_VOLUME_UP) {
+                show_ui_feedback(sent ? "媒体命令已发送" : "媒体命令发送失败", sent);
+            } else if (action_id == DESK_UI_ACTION_MEDIA_TITLE_TOGGLE) {
+                show_ui_feedback(sent ? "正在切换媒体隐私设置" : "设置发送失败", sent);
+            } else if (action_id == DESK_UI_ACTION_OPEN_MAC_HELPER) {
+                show_ui_feedback(sent ? "已在 Mac 打开助手" : "无法通知 Mac 助手", sent);
+            } else if (action_id >= DESK_UI_ACTION_CODEX_TASK_1 &&
+                       action_id <= DESK_UI_ACTION_CODEX_TASK_6) {
+                show_ui_feedback(sent ? "正在 Mac 中打开 Codex 任务" : "Codex 任务打开失败", sent);
+            } else if (action_id == DESK_UI_ACTION_OPEN_CODEX) {
+                show_ui_feedback(sent ? "正在 Mac 中打开 Codex" : "Codex 打开失败", sent);
+            } else if (action_id == DESK_UI_ACTION_OPEN_CLAUDE) {
+                show_ui_feedback(sent ? "正在 Mac 中打开 Warp" : "Warp 打开失败", sent);
+            }
+            break;
+        }
+    }
+}
+
 static void supervisor_task(void *argument)
 {
     (void)argument;
@@ -949,10 +1313,11 @@ static void supervisor_task(void *argument)
             handle_ble_event(&event);
         }
 
+        const uint32_t now_ms = uptime_ms();
         uint16_t action_id = 0;
         while (runtime.ui_action_queue != NULL &&
                xQueueReceive(runtime.ui_action_queue, &action_id, 0) == pdTRUE) {
-            send_ui_action(action_id);
+            handle_ui_action(action_id, now_ms);
         }
 
         desk_network_event_t network_event;
@@ -970,7 +1335,6 @@ static void supervisor_task(void *argument)
             handle_market_event(&market_event);
         }
 
-        const uint32_t now_ms = uptime_ms();
         if ((int32_t)(now_ms - runtime.next_diagnostics_update_ms) >= 0) {
             runtime.next_diagnostics_update_ms = now_ms + 5000U;
             update_device_diagnostics(now_ms);
@@ -994,27 +1358,33 @@ static void font_loader_task(void *argument)
      * （逐字节解析，约几十秒），故放后台低优先级任务、锁外加载，避免阻塞联网与
      * UI；加载完成后仅在设置 fallback 的一瞬间加 LVGL 锁。 */
     const char *path = "S:" DESK_STORAGE_ROOT_DIR "/assets/desk_ui_cjk_font_16.bin";
-    bool mounted = false;
-    for (int i = 0; i < 50; ++i) {  /* 最多等 5 秒 SD 挂载 */
-        if (desk_storage_get_status().mounted) {
-            mounted = true;
+    bool waiting_logged = false;
+    for (;;) {
+        if (!desk_storage_get_status().mounted) {
+            if (!waiting_logged) {
+                ESP_LOGW(TAG, "Waiting for SD before loading the CJK fallback font");
+                waiting_logged = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        waiting_logged = false;
+        /* 锁外加载：lv_binfont_create 只用堆（CLIB malloc 线程安全）与文件系统，
+         * 构建中的字体对象在接入前是孤立的，不触碰共享 LVGL 状态。 */
+        lv_font_t *cjk = lv_binfont_create(path);
+        if (cjk != NULL && esp_lv_adapter_lock(-1) == ESP_OK) {
+            desk_ui_set_cjk_fallback(cjk);
+            esp_lv_adapter_unlock();
+            ESP_LOGI(TAG, "CJK fallback font loaded (%s)", path);
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        if (cjk != NULL) {
+            lv_binfont_destroy(cjk);
+        }
+        ESP_LOGW(TAG, "CJK fallback font load failed; retrying in 30 seconds (%s)", path);
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
-    if (!mounted) {
-        ESP_LOGW(TAG, "SD not mounted; CJK fallback unavailable (fixed UI text still renders)");
-        vTaskDelete(NULL);
-        return;
-    }
-    /* 锁外加载：lv_binfont_create 只用堆（CLIB malloc 线程安全）与文件系统，
-     * 构建中的字体对象在接入前是孤立的，不触碰共享 LVGL 状态。 */
-    lv_font_t *cjk = lv_binfont_create(path);
-    if (cjk != NULL && esp_lv_adapter_lock(-1) == ESP_OK) {
-        desk_ui_set_cjk_fallback(cjk);
-        esp_lv_adapter_unlock();
-    }
-    ESP_LOGI(TAG, "CJK fallback font %s (%s)", cjk != NULL ? "loaded" : "load FAILED", path);
     vTaskDelete(NULL);
 }
 
@@ -1103,7 +1473,10 @@ void app_main(void)
         profile->display_name
     );
 
-    xTaskCreate(font_loader_task, "font_load", 6144, NULL, 1, NULL);
+    const BaseType_t font_task_created = xTaskCreate(font_loader_task, "font_load", 6144, NULL, 1, NULL);
+    if (font_task_created != pdPASS) {
+        ESP_LOGW(TAG, "Unable to create the CJK fallback font loader task");
+    }
 
     esp_err_t nvs_result = nvs_flash_init();
     if (nvs_result == ESP_ERR_NVS_NO_FREE_PAGES || nvs_result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1116,6 +1489,14 @@ void app_main(void)
     ESP_ERROR_CHECK(desk_app_auth_init());
     ESP_ERROR_CHECK(desk_http_fetch_init());
 
+    /* Finish GATT registration before Wi-Fi starts authenticating. The Wi-Fi
+     * driver briefly suspends flash-cache access during radio setup; HID/DIS
+     * registration reads service metadata from flash and must not race it. */
+    const esp_err_t ble_result = desk_ble_link_start();
+    if (ble_result != ESP_OK) {
+        ESP_LOGE(TAG, "BLE startup failed; display remains available: %s", esp_err_to_name(ble_result));
+    }
+
     const esp_err_t network_result = desk_network_start();
     if (network_result != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi startup failed; public network data is unavailable: %s", esp_err_to_name(network_result));
@@ -1127,11 +1508,6 @@ void app_main(void)
     const esp_err_t market_result = desk_market_start();
     if (market_result != ESP_OK) {
         ESP_LOGE(TAG, "A-share index worker startup failed: %s", esp_err_to_name(market_result));
-    }
-
-    const esp_err_t ble_result = desk_ble_link_start();
-    if (ble_result != ESP_OK) {
-        ESP_LOGE(TAG, "BLE startup failed; display remains available: %s", esp_err_to_name(ble_result));
     }
 
     const BaseType_t task_created = xTaskCreate(

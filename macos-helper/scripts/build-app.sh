@@ -37,16 +37,28 @@ binary_path=$(swift build -c "$configuration" --show-bin-path)
 app_path="$project_dir/.build/桌面控制台助手.app"
 
 mkdir -p "$app_path/Contents/MacOS"
+mkdir -p "$app_path/Contents/Resources"
 cp "$binary_path/DeskConsoleHelper" "$app_path/Contents/MacOS/DeskConsoleHelper"
 cp "$project_dir/AppInfo.plist" "$app_path/Contents/Info.plist"
+xcrun clang \
+    -dynamiclib \
+    -fobjc-arc \
+    -fblocks \
+    -framework Foundation \
+    -framework AppKit \
+    "$project_dir/Native/DeskMediaBridge.m" \
+    -o "$app_path/Contents/Resources/DeskMediaBridge.dylib"
 # 固定签名身份（自签名证书）：ad-hoc 签名（-s -）每次构建都变，会使钥匙串
 # 认证密钥的 ACL 失效（-128），并引发"忘记设备+重新登记"循环。固定身份让
 # 重建后钥匙串与蓝牙权限保持稳定。
 codesign \
     --force \
     --sign "$SIGN_IDENTITY" \
+    "$app_path/Contents/Resources/DeskMediaBridge.dylib" >/dev/null
+codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
     --identifier com.dongyu.desk-console-helper \
-    --requirements '=designated => identifier "com.dongyu.desk-console-helper"' \
     "$app_path" >/dev/null
 
 echo "$app_path"

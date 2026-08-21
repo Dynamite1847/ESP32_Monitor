@@ -10,6 +10,8 @@ enum DeskMessageType: UInt16 {
     case systemState = 0x0100
     case controlLayout = 0x0110
     case aiState = 0x0120
+    case aiTasks = 0x0121
+    case aiClaudeTasks = 0x0122
     case mediaState = 0x0130
     case actionTrigger = 0x0200
     case wifiProvision = 0x0300

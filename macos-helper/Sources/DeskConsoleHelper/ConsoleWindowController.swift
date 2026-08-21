@@ -188,7 +188,7 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         weatherSaveButton.frame = NSRect(x: 330, y: y - 28, width: 134, height: 26)
         content.addSubview(weatherSaveButton)
 
-        // 天气配置预填：Host/经纬度非敏感存 UserDefaults，API Key 存钥匙串。
+        // 天气配置预填：Host/经纬度存 UserDefaults，API Key 存助手私有文件。
         if let savedHost = UserDefaults.standard.string(forKey: "desk.weather.host") {
             hostField.stringValue = savedHost
         }
@@ -230,12 +230,12 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
     // MARK: - Wi-Fi 操作
 
     private func loadProfiles() {
-        // 新格式：UserDefaults 存 SSID 列表，密码存钥匙串。
+        // 新格式：UserDefaults 存 SSID 列表，密码存助手私有文件。
         if let ssids = UserDefaults.standard.stringArray(forKey: Self.profilesKey) {
             profiles = ssids.map { WiFiProfile(ssid: $0, password: DeskSecretStore.get("wifi:" + $0) ?? "") }
             return
         }
-        // 旧格式迁移：曾把 {ssid,password} JSON 明文存在同一 key，迁到钥匙串后按新格式重存。
+        // 旧格式迁移：曾把 {ssid,password} JSON 明文存在同一 key，拆分后按新格式重存。
         if let data = UserDefaults.standard.data(forKey: Self.profilesKey),
            let decoded = try? JSONDecoder().decode([WiFiProfile].self, from: data) {
             profiles = decoded
@@ -292,7 +292,7 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         do {
             try controller.provisionWiFi(ssid: profile.ssid, password: profile.password)
             UserDefaults.standard.set(profile.ssid, forKey: Self.lastUsedKey)
-            // 同步到旧对话框预填：SSID 存 UserDefaults，密码存钥匙串。
+            // 同步到旧对话框预填：SSID 存 UserDefaults，密码存助手私有文件。
             UserDefaults.standard.set(profile.ssid, forKey: "desk.wifi.ssid")
             DeskSecretStore.set(profile.password, for: "wifi:" + profile.ssid)
             showMessage(title: "已下发", message: "正在将「\(profile.ssid)」发送给设备…")
@@ -314,7 +314,7 @@ final class ConsoleWindowController: NSWindowController, NSTableViewDataSource, 
         do {
             try controller.configureWeather(host: host, apiKey: key, longitude: longitude, latitude: latitude)
             // 配置一次即可：设备侧存入 NVS 永久生效，Mac 侧记住用于预填。
-            // Host/经纬度非敏感存 UserDefaults，API Key 存钥匙串。
+            // Host/经纬度存 UserDefaults，API Key 存助手私有文件。
             UserDefaults.standard.set(host, forKey: "desk.weather.host")
             DeskSecretStore.set(key, for: "weather:key")
             UserDefaults.standard.removeObject(forKey: "desk.weather.key")  // 清理旧明文

@@ -11,6 +11,7 @@ extern "C" {
 #define DESK_HOURLY_FORECAST_COUNT 6
 #define DESK_MARKET_INDEX_COUNT 6
 #define DESK_AI_PROVIDER_COUNT 2
+#define DESK_AI_TASK_SLOT_COUNT 6
 
 typedef enum {
     DESK_WEATHER_UNKNOWN = 0,
@@ -116,6 +117,15 @@ typedef struct {
     int32_t storage_last_error;
     uint32_t log_written_entries;
     uint32_t log_dropped_entries;
+    uint32_t log_queued_entries;
+    uint32_t wifi_reconnect_attempts;
+    uint8_t wifi_last_disconnect_reason;
+    bool wifi_credentials_available;
+    char wifi_ssid[33];
+    bool ble_bonded;
+    uint16_t ble_mtu;
+    uint32_t heartbeat_age_ms;
+    uint32_t diagnostic_snapshots;
 } desk_device_state_t;
 
 typedef struct {
@@ -126,24 +136,40 @@ typedef struct {
     uint8_t secondary_usage_percent;
     uint16_t primary_window_minutes;
     uint16_t secondary_window_minutes;
+    uint32_t primary_reset_seconds;
+    uint32_t secondary_reset_seconds;
     uint8_t active_task_count;
+    uint8_t available_task_slots;
     desk_ai_task_status_t task_status;
     uint32_t elapsed_seconds;
 } desk_ai_provider_state_t;
 
 typedef struct {
+    bool assigned;
+    char name[40];
+    desk_ai_task_status_t status;
+    char detail[24];  /* 可选副文本，如“3 分钟前”；Codex 留空，Claude 显示上次活动。 */
+} desk_ai_task_slot_t;
+
+typedef struct {
     bool valid;
     desk_ai_provider_state_t providers[DESK_AI_PROVIDER_COUNT];
+    desk_ai_task_slot_t codex_tasks[DESK_AI_TASK_SLOT_COUNT];
+    desk_ai_task_slot_t claude_tasks[DESK_AI_TASK_SLOT_COUNT];
 } desk_ai_state_t;
 
 typedef struct {
     bool valid;
+    bool metadata_available;
     bool playing;
     bool title_hidden;
+    bool muted;
     uint8_t volume_percent;
     uint32_t position_seconds;
     uint32_t duration_seconds;
-    char title[64];
+    char title[96];
+    char artist[64];
+    char source[32];
 } desk_media_state_t;
 
 typedef struct {

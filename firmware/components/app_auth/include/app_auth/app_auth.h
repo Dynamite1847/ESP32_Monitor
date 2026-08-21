@@ -38,6 +38,9 @@ void desk_app_auth_reset_session(void);
 
 bool desk_app_auth_has_shared_key(void);
 
+/** Allow one replacement key to be enrolled by the already bonded Mac. */
+bool desk_app_auth_migration_enrollment_pending(void);
+
 /**
  * Start a challenge from a HELLO payload. When enrollment is requested and no
  * key exists, allow_enrollment controls whether a new key may be generated.

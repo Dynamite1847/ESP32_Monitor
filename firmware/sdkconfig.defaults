@@ -11,6 +11,7 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # 任务看门狗：卡死时 panic → 自恢复重启（而非硬挂）。超时给足 10s 覆盖
 # 字体后台加载与 TLS 握手的 CPU 尖峰，避免 idle 短暂饿死误触发。
 CONFIG_ESP_TASK_WDT_EN=y
@@ -58,6 +59,17 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_CTRL_BLE_MAX_ACT=2
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+# Codex desktop recognizes the open Codex Micro vendor-HID shape. Two report
+# characteristics carry 63-byte JSON input/output bodies with report ID 6.
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+CONFIG_BT_NIMBLE_SVC_HID_MAX_INSTANCES=2
+CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS=3
+CONFIG_BT_NIMBLE_BAS_SERVICE=y
+CONFIG_BT_NIMBLE_SVC_BAS_BATTERY_LEVEL_NOTIFY=y
+CONFIG_BT_NIMBLE_DIS_SERVICE=y
+CONFIG_BT_NIMBLE_SVC_DIS_MANUFACTURER_NAME=y
+CONFIG_BT_NIMBLE_SVC_DIS_FIRMWARE_REVISION=y
+CONFIG_BT_NIMBLE_SVC_DIS_PNP_ID=y
 
 # Wi-Fi buffers kept modest: desk console traffic is small periodic HTTPS
 # requests, and every dynamic/static buffer occupies scarce internal RAM.
@@ -75,6 +87,10 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # Board profile: the 4.3 (non-B) board was retired; 4.3B is the target device.
 CONFIG_DESK_BOARD_4_3_B=y
 # CONFIG_DESK_BOARD_4_3 is not set
+# Privacy-safe normal build. First-owner enrollment uses a short-lived recovery
+# build that explicitly enables CONFIG_DESK_ALLOW_APP_ENROLLMENT.
+# CONFIG_DESK_BRINGUP_DISPLAY_ON is not set
+# CONFIG_DESK_ALLOW_APP_ENROLLMENT is not set
 
 # CJK 后备字库外置到 SD：LVGL 用 CLIB malloc 让 ~2.3MB 字体落 PSRAM（内置 64KB 池装不下），
 # 并启用 STDIO 文件系统驱动（盘符 'S'=83）读取 /sdcard 上的 .bin 字体。

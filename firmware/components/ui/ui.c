@@ -26,6 +26,10 @@ typedef enum {
     PAGE_LIBRARY,
     PAGE_SETTINGS,
     PAGE_DIAGNOSTICS,
+    PAGE_CODEX,
+    PAGE_CODEX_COMMANDS,
+    PAGE_CODEX_NAVIGATION,
+    PAGE_CLAUDE,
     PAGE_COUNT,
     DOCK_PAGE_COUNT = PAGE_LIBRARY + 1,
     DAILY_PAGE_COUNT = PAGE_MEDIA + 1,
@@ -41,6 +45,10 @@ static const char *const PAGE_TITLES[PAGE_COUNT] = {
     "页面库",
     "设置",
     "设备诊断",
+    "Codex 控制台",
+    "Codex 快捷控制",
+    "Codex 导航与旋钮",
+    "Claude Code 控制台",
 };
 
 static const char *const DOCK_TITLES[DOCK_PAGE_COUNT] = {
@@ -58,6 +66,8 @@ static lv_obj_t *content_area;
 static lv_obj_t *clock_label;
 static lv_obj_t *date_label;
 static lv_timer_t *clock_timer;
+static lv_obj_t *feedback_panel;
+static lv_timer_t *feedback_timer;
 static page_id_t current_page = PAGE_HOME;
 static desk_app_state_t app_state;
 static bool ui_initialized;
@@ -99,15 +109,35 @@ typedef struct {
     lv_obj_t *ai_secondary[DESK_AI_PROVIDER_COUNT];
     lv_obj_t *ai_secondary_bar[DESK_AI_PROVIDER_COUNT];
     lv_obj_t *ai_status[DESK_AI_PROVIDER_COUNT];
+    lv_obj_t *ai_overview_tasks[DESK_AI_PROVIDER_COUNT];
+    lv_obj_t *ai_overview_detail[DESK_AI_PROVIDER_COUNT];
+    lv_obj_t *ai_overview_usage[DESK_AI_PROVIDER_COUNT];
+    lv_obj_t *ai_page_summary;
+    lv_obj_t *ai_reset[2];
+    lv_obj_t *ai_slot_button[DESK_AI_TASK_SLOT_COUNT];
+    lv_obj_t *ai_slot_name[DESK_AI_TASK_SLOT_COUNT];
+    lv_obj_t *ai_slot_status[DESK_AI_TASK_SLOT_COUNT];
+    lv_obj_t *ai_slot_detail[DESK_AI_TASK_SLOT_COUNT];
+    lv_obj_t *media_source;
+    lv_obj_t *media_status;
     lv_obj_t *media_title;
+    lv_obj_t *media_artist;
     lv_obj_t *media_play_label;
     lv_obj_t *media_progress;
     lv_obj_t *media_position;
     lv_obj_t *media_duration;
+    lv_obj_t *media_volume;
+    lv_obj_t *media_volume_value;
+    lv_obj_t *media_mute_label;
     lv_obj_t *settings_value[4];
     lv_obj_t *settings_detail[4];
+    lv_obj_t *settings_action[4];
+    lv_obj_t *settings_action_label[4];
     lv_obj_t *diagnostic_value[6];
     lv_obj_t *diagnostic_detail[6];
+    lv_obj_t *diagnostic_summary;
+    lv_obj_t *diagnostic_refresh;
+    lv_obj_t *diagnostic_snapshot;
 } ui_bindings_t;
 
 static ui_bindings_t bindings;
@@ -187,6 +217,53 @@ static void set_label_text(lv_obj_t *label, const char *text)
     if (label != NULL) {
         lv_label_set_text(label, text);
     }
+}
+
+static void feedback_timer_callback(lv_timer_t *timer)
+{
+    (void)timer;
+    if (feedback_panel != NULL) {
+        lv_obj_delete(feedback_panel);
+        feedback_panel = NULL;
+    }
+    feedback_timer = NULL;
+}
+
+void desk_ui_show_feedback(const char *message, bool succeeded)
+{
+    if (!ui_initialized || root_screen == NULL || message == NULL) {
+        return;
+    }
+    if (feedback_timer != NULL) {
+        lv_timer_delete(feedback_timer);
+        feedback_timer = NULL;
+    }
+    if (feedback_panel != NULL) {
+        lv_obj_delete(feedback_panel);
+    }
+    feedback_panel = lv_obj_create(root_screen);
+    remove_all_styles(feedback_panel);
+    lv_obj_set_size(feedback_panel, 440, 46);
+    lv_obj_align(feedback_panel, LV_ALIGN_TOP_MID, 0, STATUS_BAR_HEIGHT + 10);
+    lv_obj_set_style_bg_color(
+        feedback_panel,
+        succeeded ? lv_color_hex(0x174432) : lv_color_hex(0x5A2D2D),
+        0
+    );
+    lv_obj_set_style_bg_opa(feedback_panel, LV_OPA_90, 0);
+    lv_obj_set_style_radius(feedback_panel, 12, 0);
+    lv_obj_set_style_shadow_width(feedback_panel, 18, 0);
+    lv_obj_set_style_shadow_opa(feedback_panel, LV_OPA_30, 0);
+    lv_obj_clear_flag(feedback_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *label = create_label(feedback_panel, message, &desk_ui_font_16, lv_color_hex(0xFFFFFF));
+    lv_obj_set_width(label, 410);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_center(label);
+    lv_obj_move_foreground(feedback_panel);
+
+    feedback_timer = lv_timer_create(feedback_timer_callback, 1800, NULL);
+    lv_timer_set_repeat_count(feedback_timer, 1);
 }
 
 static lv_color_t alert_color(desk_alert_level_t level)
@@ -619,6 +696,24 @@ static void action_button_callback(lv_event_t *event)
     action_callback(action_id, action_callback_context);
 }
 
+static void action_event_callback(lv_event_t *event)
+{
+    if (action_callback == NULL) {
+        return;
+    }
+    action_callback(
+        (desk_ui_action_id_t)(uintptr_t)lv_event_get_user_data(event),
+        action_callback_context
+    );
+}
+
+static void codex_page_navigation_callback(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        render_page((page_id_t)(intptr_t)lv_event_get_user_data(event));
+    }
+}
+
 static lv_obj_t *create_action_button(
     lv_obj_t *parent,
     int32_t x,
@@ -639,6 +734,43 @@ static lv_obj_t *create_action_button(
         lv_obj_add_event_cb(button, action_button_callback, LV_EVENT_CLICKED, (void *)(uintptr_t)action_id);
     }
     return button;
+}
+
+static lv_obj_t *create_compact_action_button(
+    lv_obj_t *parent,
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    const char *title,
+    desk_ui_action_id_t action_id
+)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    lv_obj_set_size(button, width, 40);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x233746), 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x35566D), 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_t *label = create_label(button, title, &desk_ui_font_16, lv_color_hex(0x9DD7FF));
+    lv_obj_center(label);
+    lv_obj_add_event_cb(button, action_button_callback, LV_EVENT_CLICKED, (void *)(uintptr_t)action_id);
+    return button;
+}
+
+static void set_button_enabled(lv_obj_t *button, bool enabled)
+{
+    if (button == NULL) {
+        return;
+    }
+    if (enabled) {
+        lv_obj_remove_state(button, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(button, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_add_state(button, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(button, LV_OPA_40, 0);
+    }
 }
 
 static void refresh_control_page(void)
@@ -709,115 +841,245 @@ static void create_control_page(void)
     refresh_control_page();
 }
 
+static void ai_page_navigation_callback(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        render_page((page_id_t)(intptr_t)lv_event_get_user_data(event));
+    }
+}
+
+static void format_reset_countdown(char *output, size_t output_size, uint32_t seconds)
+{
+    if (seconds == 0U) {
+        snprintf(output, output_size, "重置时间读取中");
+    } else if (seconds >= 86400U) {
+        snprintf(output, output_size, "%lu天%lu小时后重置",
+                 (unsigned long)(seconds / 86400U),
+                 (unsigned long)((seconds % 86400U) / 3600U));
+    } else if (seconds >= 3600U) {
+        snprintf(output, output_size, "%lu小时%lu分钟后重置",
+                 (unsigned long)(seconds / 3600U),
+                 (unsigned long)((seconds % 3600U) / 60U));
+    } else {
+        snprintf(output, output_size, "%lu分钟后重置",
+                 (unsigned long)((seconds + 59U) / 60U));
+    }
+}
+
+static void format_reset_time(char *output, size_t output_size, uint32_t seconds)
+{
+    if (seconds == 0U) {
+        snprintf(output, output_size, "刷新时间读取中");
+        return;
+    }
+
+    const time_t now = time(NULL);
+    if (now < 1700000000) {
+        format_reset_countdown(output, output_size, seconds);
+        return;
+    }
+
+    const time_t reset_at = now + (time_t)seconds;
+    struct tm local_reset = {0};
+    if (localtime_r(&reset_at, &local_reset) == NULL) {
+        format_reset_countdown(output, output_size, seconds);
+        return;
+    }
+
+    if (seconds >= 86400U) {
+        snprintf(output, output_size, "%d月%d日 %02d:%02d 刷新 · %lu天%lu小时后",
+                 local_reset.tm_mon + 1,
+                 local_reset.tm_mday,
+                 local_reset.tm_hour,
+                 local_reset.tm_min,
+                 (unsigned long)(seconds / 86400U),
+                 (unsigned long)((seconds % 86400U) / 3600U));
+    } else {
+        snprintf(output, output_size, "%d月%d日 %02d:%02d 刷新",
+                 local_reset.tm_mon + 1,
+                 local_reset.tm_mday,
+                 local_reset.tm_hour,
+                 local_reset.tm_min);
+    }
+}
+
+static uint8_t quota_remaining(uint8_t used_percent)
+{
+    return used_percent <= 100U ? (uint8_t)(100U - used_percent) : 0U;
+}
+
+static lv_color_t ai_status_color(desk_ai_task_status_t status)
+{
+    switch (status) {
+        case DESK_AI_WAITING_PERMISSION:
+        case DESK_AI_WAITING_INPUT:
+            return lv_color_hex(0xF2BE63);
+        case DESK_AI_COMPLETED:
+            return lv_color_hex(0x72E0A8);
+        case DESK_AI_FAILED:
+            return lv_color_hex(0xFF7777);
+        case DESK_AI_RUNNING:
+            return lv_color_hex(0x72C7FF);
+        case DESK_AI_IDLE:
+        default:
+            return lv_color_hex(0x8E9AA8);
+    }
+}
+
+static void refresh_ai_overview(void)
+{
+    char value[96];
+    const desk_ai_provider_state_t *codex = &app_state.ai.providers[0];
+    const desk_ai_provider_state_t *claude = &app_state.ai.providers[1];
+
+    snprintf(value, sizeof(value), "%u 个运行任务 · %u 个最近任务",
+             codex->active_task_count, codex->available_task_slots);
+    set_label_text(bindings.ai_overview_tasks[0], value);
+    snprintf(value, sizeof(value), "%s", desk_ai_status_text(codex->task_status));
+    set_label_text(bindings.ai_overview_detail[0], value);
+    if (bindings.ai_overview_detail[0] != NULL) {
+        lv_obj_set_style_text_color(bindings.ai_overview_detail[0], ai_status_color(codex->task_status), 0);
+    }
+    if (codex->secondary_usage_available) {
+        snprintf(value, sizeof(value), "周额度剩余 %u%%",
+                 quota_remaining(codex->secondary_usage_percent));
+    } else {
+        snprintf(value, sizeof(value), "Codex 额度读取中");
+    }
+    set_label_text(bindings.ai_overview_usage[0], value);
+
+    snprintf(value, sizeof(value), "%u 个终端会话", claude->active_task_count);
+    set_label_text(bindings.ai_overview_tasks[1], value);
+    snprintf(value, sizeof(value), "%s", desk_ai_status_text(claude->task_status));
+    set_label_text(bindings.ai_overview_detail[1], value);
+    if (bindings.ai_overview_detail[1] != NULL) {
+        lv_obj_set_style_text_color(bindings.ai_overview_detail[1], ai_status_color(claude->task_status), 0);
+    }
+    set_label_text(bindings.ai_overview_usage[1], "仅显示本机会话状态");
+
+    snprintf(value, sizeof(value), "Codex %u 个活动任务    Claude Code %u 个会话",
+             codex->active_task_count, claude->active_task_count);
+    set_label_text(bindings.ai_page_summary, value);
+}
+
+static void refresh_codex_page(void)
+{
+    const desk_ai_provider_state_t *codex = &app_state.ai.providers[0];
+    char value[96];
+    const uint8_t weekly_remaining = quota_remaining(codex->secondary_usage_percent);
+    if (codex->secondary_usage_available) {
+        snprintf(value, sizeof(value), "周额度剩余  %u%%", weekly_remaining);
+    } else {
+        snprintf(value, sizeof(value), "周额度读取中");
+    }
+    set_label_text(bindings.ai_secondary[0], value);
+    lv_bar_set_value(bindings.ai_secondary_bar[0],
+                     codex->secondary_usage_available ? weekly_remaining : 0,
+                     LV_ANIM_OFF);
+    if (codex->secondary_usage_available) {
+        format_reset_time(value, sizeof(value), codex->secondary_reset_seconds);
+    } else {
+        snprintf(value, sizeof(value), "刷新时间读取中");
+    }
+    set_label_text(bindings.ai_reset[1], value);
+
+    for (size_t i = 0; i < DESK_AI_TASK_SLOT_COUNT; ++i) {
+        const desk_ai_task_slot_t *task = &app_state.ai.codex_tasks[i];
+        const bool assigned = task->assigned && i < codex->available_task_slots;
+        if (assigned) {
+            snprintf(value, sizeof(value), "%s", task->name);
+        } else {
+            snprintf(value, sizeof(value), "未分配");
+        }
+        set_label_text(bindings.ai_slot_name[i], value);
+        if (assigned) {
+            const char *suffix = task->status == DESK_AI_WAITING_PERMISSION ||
+                                         task->status == DESK_AI_WAITING_INPUT
+                                     ? " · 点击处理"
+                                     : (task->status == DESK_AI_COMPLETED || task->status == DESK_AI_FAILED
+                                            ? " · 点击查看"
+                                            : " · 点击打开");
+            snprintf(value, sizeof(value), "%s%s", desk_ai_status_text(task->status), suffix);
+            set_label_text(bindings.ai_slot_status[i], value);
+            lv_obj_set_style_text_color(bindings.ai_slot_status[i], ai_status_color(task->status), 0);
+        } else {
+            set_label_text(bindings.ai_slot_status[i], "暂无任务");
+            lv_obj_set_style_text_color(bindings.ai_slot_status[i], lv_color_hex(0x697581), 0);
+        }
+        set_button_enabled(bindings.ai_slot_button[i], assigned);
+    }
+}
+
+static void refresh_claude_page(void)
+{
+    const desk_ai_provider_state_t *claude = &app_state.ai.providers[1];
+    char value[64];
+    snprintf(value, sizeof(value), "%u 个 Claude Code 会话 · 不统计额度", claude->available_task_slots);
+    set_label_text(bindings.ai_page_summary, value);
+    for (size_t i = 0; i < DESK_AI_TASK_SLOT_COUNT; ++i) {
+        if (bindings.ai_slot_button[i] == NULL) {
+            continue;  /* 本页未创建此槽位（Claude 只用前 CLAUDE_SESSION_CARD_COUNT 个）。 */
+        }
+        const desk_ai_task_slot_t *task = &app_state.ai.claude_tasks[i];
+        if (task->assigned) {
+            set_label_text(bindings.ai_slot_name[i], task->name);
+            char line[64];
+            if (task->detail[0] != '\0') {
+                snprintf(line, sizeof(line), "%s · %s", desk_ai_status_text(task->status), task->detail);
+            } else {
+                snprintf(line, sizeof(line), "%s", desk_ai_status_text(task->status));
+            }
+            set_label_text(bindings.ai_slot_status[i], line);
+            lv_obj_set_style_text_color(bindings.ai_slot_status[i], ai_status_color(task->status), 0);
+        } else {
+            set_label_text(bindings.ai_slot_name[i], "未分配");
+            set_label_text(bindings.ai_slot_status[i], "暂无会话");
+            lv_obj_set_style_text_color(bindings.ai_slot_status[i], lv_color_hex(0x697581), 0);
+        }
+        set_button_enabled(bindings.ai_slot_button[i], task->assigned);
+    }
+}
+
 static void refresh_ai_page(void)
 {
     if (!app_state.ai.valid) {
         return;
     }
-
-    char value[64];
-    for (size_t i = 0; i < DESK_AI_PROVIDER_COUNT; ++i) {
-        const desk_ai_provider_state_t *provider = &app_state.ai.providers[i];
-        set_label_text(bindings.ai_name[i], provider->provider);
-        if (provider->usage_available) {
-            const uint16_t minutes = provider->primary_window_minutes;
-            if (minutes >= 1440U && minutes % 1440U == 0) {
-                snprintf(value, sizeof(value), "%u 天额度   %u%%", minutes / 1440U, provider->primary_usage_percent);
-            } else if (minutes >= 60U && minutes % 60U == 0) {
-                snprintf(value, sizeof(value), "%u 小时额度   %u%%", minutes / 60U, provider->primary_usage_percent);
-            } else {
-                snprintf(value, sizeof(value), "%u 分钟额度   %u%%", minutes, provider->primary_usage_percent);
-            }
-        } else {
-            snprintf(value, sizeof(value), "%s", "用量接口待接入");
-        }
-        set_label_text(bindings.ai_primary[i], value);
-        if (bindings.ai_primary_bar[i] != NULL) {
-            lv_bar_set_value(
-                bindings.ai_primary_bar[i],
-                provider->usage_available && provider->primary_usage_percent <= 100U
-                    ? provider->primary_usage_percent : 0,
-                LV_ANIM_OFF
-            );
-        }
-        if (provider->secondary_usage_available) {
-            const uint16_t minutes = provider->secondary_window_minutes;
-            if (minutes >= 1440U && minutes % 1440U == 0) {
-                snprintf(value, sizeof(value), "%u 天额度   %u%%", minutes / 1440U, provider->secondary_usage_percent);
-            } else if (minutes >= 60U && minutes % 60U == 0) {
-                snprintf(value, sizeof(value), "%u 小时额度   %u%%", minutes / 60U, provider->secondary_usage_percent);
-            } else {
-                snprintf(value, sizeof(value), "%u 分钟额度   %u%%", minutes, provider->secondary_usage_percent);
-            }
-        } else {
-            snprintf(value, sizeof(value), "%s", "无第二额度");
-        }
-        set_label_text(bindings.ai_secondary[i], value);
-        if (bindings.ai_secondary_bar[i] != NULL) {
-            lv_bar_set_value(
-                bindings.ai_secondary_bar[i],
-                provider->secondary_usage_available && provider->secondary_usage_percent <= 100U
-                    ? provider->secondary_usage_percent : 0,
-                LV_ANIM_OFF
-            );
-        }
-        snprintf(
-            value,
-            sizeof(value),
-            "%s  %u 个任务  %02lu:%02lu",
-            desk_ai_status_text(provider->task_status),
-            provider->active_task_count,
-            (unsigned long)(provider->elapsed_seconds / 60U),
-            (unsigned long)(provider->elapsed_seconds % 60U)
-        );
-        set_label_text(bindings.ai_status[i], value);
+    if (current_page == PAGE_CODEX) {
+        refresh_codex_page();
+    } else if (current_page == PAGE_CLAUDE) {
+        refresh_claude_page();
+    } else {
+        refresh_ai_overview();
     }
 }
 
-static void create_ai_provider(size_t index, int32_t x, const desk_ai_provider_state_t *provider)
+static lv_obj_t *create_ai_overview_card(size_t index, int32_t x, page_id_t destination)
 {
-    lv_obj_t *name = create_label(content_area, provider->provider, &lv_font_montserrat_24, lv_color_hex(0xF4F7FA));
-    lv_obj_set_pos(name, x + 28, 34);
-    bindings.ai_name[index] = name;
+    const desk_ai_provider_state_t *provider = &app_state.ai.providers[index];
+    lv_obj_t *card = lv_button_create(content_area);
+    lv_obj_set_size(card, 373, 276);
+    lv_obj_set_pos(card, x, 20);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x171D24), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x233746), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(index == 0 ? 0x35566D : 0x513C68), 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
+    lv_obj_add_event_cb(card, ai_page_navigation_callback, LV_EVENT_CLICKED, (void *)(intptr_t)destination);
 
-    char value[64];
-    snprintf(value, sizeof(value), "%s", provider->usage_available ? "额度读取中" : "用量接口待接入");
-    // 中文必须用带 CJK fallback 的 desk_ui_font_16；Montserrat 无中文会显示框框。
-    lv_obj_t *primary = create_label(content_area, value, &desk_ui_font_16, lv_color_hex(0xDCE3EA));
-    lv_obj_set_pos(primary, x + 28, 92);
-    bindings.ai_primary[index] = primary;
-    lv_obj_t *primary_bar = lv_bar_create(content_area);
-    lv_obj_set_size(primary_bar, 300, 10);
-    lv_obj_set_pos(primary_bar, x + 28, 130);
-    lv_bar_set_value(primary_bar, provider->primary_usage_percent <= 100U ? provider->primary_usage_percent : 100, LV_ANIM_OFF);
-    bindings.ai_primary_bar[index] = primary_bar;
-
-    snprintf(value, sizeof(value), "%s", provider->secondary_usage_available ? "额度读取中" : "无第二额度");
-    lv_obj_t *secondary = create_label(content_area, value, &desk_ui_font_16, lv_color_hex(0xA5AFBA));
-    lv_obj_set_pos(secondary, x + 28, 170);
-    bindings.ai_secondary[index] = secondary;
-    lv_obj_t *secondary_bar = lv_bar_create(content_area);
-    lv_obj_set_size(secondary_bar, 300, 8);
-    lv_obj_set_pos(secondary_bar, x + 28, 204);
-    lv_bar_set_value(
-        secondary_bar,
-        provider->secondary_usage_percent <= 100U ? provider->secondary_usage_percent : 100,
-        LV_ANIM_OFF
-    );
-    bindings.ai_secondary_bar[index] = secondary_bar;
-
-    snprintf(
-        value,
-        sizeof(value),
-        "%s  %u 个任务  %02lu:%02lu",
-        desk_ai_status_text(provider->task_status),
-        provider->active_task_count,
-        (unsigned long)(provider->elapsed_seconds / 60U),
-        (unsigned long)(provider->elapsed_seconds % 60U)
-    );
-    lv_obj_t *status = create_label(content_area, value, &desk_ui_font_16, lv_color_hex(0x72C7FF));
-    lv_obj_set_pos(status, x + 28, 260);
-    bindings.ai_status[index] = status;
+    bindings.ai_name[index] = create_label(card, provider->provider, &lv_font_montserrat_24, lv_color_hex(0xF4F7FA));
+    lv_obj_set_pos(bindings.ai_name[index], 22, 24);
+    bindings.ai_overview_detail[index] = create_label(card, "空闲", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+    lv_obj_set_pos(bindings.ai_overview_detail[index], 255, 30);
+    bindings.ai_overview_tasks[index] = create_label(card, "正在读取", &desk_ui_font_16, lv_color_hex(0xDCE3EA));
+    lv_obj_set_pos(bindings.ai_overview_tasks[index], 22, 92);
+    bindings.ai_overview_usage[index] = create_label(card, "正在读取", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+    lv_obj_set_pos(bindings.ai_overview_usage[index], 22, 144);
+    lv_obj_t *enter = create_label(card, "进入控制台", &desk_ui_font_16,
+                                   lv_color_hex(index == 0 ? 0x72C7FF : 0xD8A8FF));
+    lv_obj_set_pos(enter, 22, 212);
+    return card;
 }
 
 static void create_ai_page(void)
@@ -827,10 +1089,288 @@ static void create_ai_page(void)
         lv_obj_center(empty);
         return;
     }
-    create_ai_provider(0, 0, &app_state.ai.providers[0]);
-    create_line(content_area, 400, 20, 1, 344);
-    create_ai_provider(1, 400, &app_state.ai.providers[1]);
-    refresh_ai_page();
+    create_ai_overview_card(0, 18, PAGE_CODEX);
+    create_ai_overview_card(1, 409, PAGE_CLAUDE);
+    bindings.ai_page_summary = create_label(content_area, "正在读取 AI 状态", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+    lv_obj_align(bindings.ai_page_summary, LV_ALIGN_BOTTOM_MID, 0, -34);
+    refresh_ai_overview();
+}
+
+static lv_obj_t *create_ai_task_slot(size_t index, desk_ui_action_id_t action_id)
+{
+    const int32_t x = 18 + (int32_t)(index % 3U) * 261;
+    const int32_t y = 104 + (int32_t)(index / 3U) * 100;
+    lv_obj_t *button = lv_button_create(content_area);
+    lv_obj_set_size(button, 242, 86);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x171D24), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x233746), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(button, 10, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x303844), 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_add_event_cb(button, action_button_callback, LV_EVENT_CLICKED, (void *)(uintptr_t)action_id);
+    bindings.ai_slot_button[index] = button;
+    bindings.ai_slot_detail[index] = NULL;  /* Codex 槽位无副文本，避免切页后悬垂引用。 */
+    bindings.ai_slot_name[index] = create_label(button, "未分配", &desk_ui_font_16, lv_color_hex(0xE8EDF2));
+    lv_obj_set_pos(bindings.ai_slot_name[index], 14, 16);
+    lv_obj_set_width(bindings.ai_slot_name[index], 214);
+    lv_label_set_long_mode(bindings.ai_slot_name[index], LV_LABEL_LONG_DOT);
+    bindings.ai_slot_status[index] = create_label(button, "暂无任务", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(bindings.ai_slot_status[index], 14, 48);
+    return button;
+}
+
+static void create_codex_page(void)
+{
+    if (!app_state.ai.valid) {
+        lv_obj_t *empty = create_label(content_area, "Mac 未连接，Codex 状态已清除", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+        lv_obj_center(empty);
+        return;
+    }
+    bindings.ai_secondary[0] = create_label(content_area, "Codex 周额度读取中", &desk_ui_font_16, lv_color_hex(0xDCE3EA));
+    lv_obj_set_pos(bindings.ai_secondary[0], 18, 12);
+    bindings.ai_secondary_bar[0] = lv_bar_create(content_area);
+    lv_obj_set_size(bindings.ai_secondary_bar[0], 370, 10);
+    lv_obj_set_pos(bindings.ai_secondary_bar[0], 18, 43);
+    bindings.ai_reset[1] = create_label(content_area, "刷新时间读取中", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(bindings.ai_reset[1], 18, 64);
+
+    for (size_t i = 0; i < DESK_AI_TASK_SLOT_COUNT; ++i) {
+        create_ai_task_slot(i, (desk_ui_action_id_t)(DESK_UI_ACTION_CODEX_TASK_1 + i));
+    }
+    lv_obj_t *controls = create_compact_action_button(content_area, 470, 318, 150, "快捷控制", 0);
+    lv_obj_remove_event_cb(controls, action_button_callback);
+    lv_obj_add_event_cb(
+        controls,
+        codex_page_navigation_callback,
+        LV_EVENT_CLICKED,
+        (void *)(intptr_t)PAGE_CODEX_COMMANDS
+    );
+    create_compact_action_button(content_area, 632, 318, 150, "打开 Codex", DESK_UI_ACTION_OPEN_CODEX);
+    lv_obj_t *hint = create_label(content_area, "只同步标题和状态 · 正文与路径留在 Mac", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(hint, 18, 329);
+    refresh_codex_page();
+}
+
+typedef enum {
+    CODEX_CONTROL_TAP = 0,
+    CODEX_CONTROL_LONG_PRESS,
+    CODEX_CONTROL_HOLD,
+} codex_control_gesture_t;
+
+static lv_obj_t *create_codex_control_button(
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    int32_t height,
+    const char *title,
+    const char *hint,
+    desk_ui_action_id_t primary_action,
+    desk_ui_action_id_t release_action,
+    codex_control_gesture_t gesture
+)
+{
+    lv_obj_t *button = lv_button_create(content_area);
+    lv_obj_set_size(button, width, height);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x171D24), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x29465A), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(button, 11, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(
+        button,
+        gesture == CODEX_CONTROL_LONG_PRESS ? lv_color_hex(0x765A2E) : lv_color_hex(0x35566D),
+        0
+    );
+    lv_obj_set_style_shadow_width(button, 0, 0);
+
+    lv_obj_t *title_label = create_label(button, title, &desk_ui_font_16, lv_color_hex(0xE8EDF2));
+    lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, 14, 13);
+    lv_obj_t *hint_label = create_label(
+        button,
+        hint,
+        &desk_ui_font_16,
+        gesture == CODEX_CONTROL_LONG_PRESS ? lv_color_hex(0xF2BE63) : lv_color_hex(0x7894A8)
+    );
+    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_LEFT, 14, -12);
+
+    if (gesture == CODEX_CONTROL_HOLD) {
+        lv_obj_add_event_cb(button, action_event_callback, LV_EVENT_PRESSED, (void *)(uintptr_t)primary_action);
+        lv_obj_add_event_cb(button, action_event_callback, LV_EVENT_RELEASED, (void *)(uintptr_t)release_action);
+        lv_obj_add_event_cb(button, action_event_callback, LV_EVENT_PRESS_LOST, (void *)(uintptr_t)release_action);
+    } else {
+        lv_obj_add_event_cb(
+            button,
+            action_event_callback,
+            gesture == CODEX_CONTROL_LONG_PRESS ? LV_EVENT_LONG_PRESSED : LV_EVENT_CLICKED,
+            (void *)(uintptr_t)primary_action
+        );
+    }
+    return button;
+}
+
+static void create_codex_commands_page(void)
+{
+    lv_obj_t *intro = create_label(
+        content_area,
+        "六个原生命令键 · 批准和拒绝需长按，语音键按住生效",
+        &desk_ui_font_16,
+        lv_color_hex(0x8E9AA8)
+    );
+    lv_obj_set_pos(intro, 18, 14);
+
+    static const char *const titles[6] = {
+        "快速模式", "长按批准", "长按拒绝", "续开新对话", "按住说话", "发送"
+    };
+    static const char *const hints[6] = {
+        "切换 Fast", "防误触", "防误触", "从当前任务续开", "支持按住与双击", "提交输入"
+    };
+    static const desk_ui_action_id_t actions[6] = {
+        DESK_UI_ACTION_CODEX_FAST,
+        DESK_UI_ACTION_CODEX_APPROVE,
+        DESK_UI_ACTION_CODEX_DECLINE,
+        DESK_UI_ACTION_CODEX_CONTINUE,
+        DESK_UI_ACTION_CODEX_MIC_PRESS,
+        DESK_UI_ACTION_CODEX_SEND,
+    };
+    for (size_t i = 0; i < 6; ++i) {
+        const int32_t x = 18 + (int32_t)(i % 3U) * 261;
+        const int32_t y = 54 + (int32_t)(i / 3U) * 104;
+        const codex_control_gesture_t gesture =
+            i == 1 || i == 2 ? CODEX_CONTROL_LONG_PRESS :
+            (i == 4 ? CODEX_CONTROL_HOLD : CODEX_CONTROL_TAP);
+        create_codex_control_button(
+            x,
+            y,
+            242,
+            90,
+            titles[i],
+            hints[i],
+            actions[i],
+            i == 4 ? DESK_UI_ACTION_CODEX_MIC_RELEASE : 0,
+            gesture
+        );
+    }
+
+    lv_obj_t *navigation = create_compact_action_button(content_area, 566, 286, 216, "导航与旋钮", 0);
+    lv_obj_remove_event_cb(navigation, action_button_callback);
+    lv_obj_add_event_cb(
+        navigation,
+        codex_page_navigation_callback,
+        LV_EVENT_CLICKED,
+        (void *)(intptr_t)PAGE_CODEX_NAVIGATION
+    );
+    lv_obj_t *hint = create_label(
+        content_area,
+        "按键可在 Codex 设置中重映射；默认命令与官方 Codex Micro 一致",
+        &desk_ui_font_16,
+        lv_color_hex(0x697581)
+    );
+    lv_obj_set_pos(hint, 18, 335);
+}
+
+static void create_codex_navigation_page(void)
+{
+    lv_obj_t *intro = create_label(
+        content_area,
+        "方向键和旋钮由 Codex 原生解释；可映射计划、历史、侧栏、滚动、推理和技能",
+        &desk_ui_font_16,
+        lv_color_hex(0x8E9AA8)
+    );
+    lv_obj_set_pos(intro, 18, 14);
+
+    create_codex_control_button(142, 56, 150, 62, "上", "计划模式", DESK_UI_ACTION_CODEX_UP, 0, CODEX_CONTROL_TAP);
+    create_codex_control_button(18, 128, 150, 62, "左", "历史后退", DESK_UI_ACTION_CODEX_LEFT, 0, CODEX_CONTROL_TAP);
+    create_codex_control_button(266, 128, 150, 62, "右", "历史前进", DESK_UI_ACTION_CODEX_RIGHT, 0, CODEX_CONTROL_TAP);
+    create_codex_control_button(142, 200, 150, 62, "下", "切换侧栏", DESK_UI_ACTION_CODEX_DOWN, 0, CODEX_CONTROL_TAP);
+
+    create_codex_control_button(454, 56, 150, 82, "逆时针", "上一个 / 减少", DESK_UI_ACTION_CODEX_DIAL_CCW, 0, CODEX_CONTROL_TAP);
+    create_codex_control_button(620, 56, 162, 82, "顺时针", "下一个 / 增加", DESK_UI_ACTION_CODEX_DIAL_CW, 0, CODEX_CONTROL_TAP);
+    create_codex_control_button(
+        454,
+        154,
+        328,
+        108,
+        "旋钮按下",
+        "点击选择 · 长按打开控制设置",
+        DESK_UI_ACTION_CODEX_DIAL_PRESS,
+        DESK_UI_ACTION_CODEX_DIAL_RELEASE,
+        CODEX_CONTROL_HOLD
+    );
+
+    lv_obj_t *hint = create_label(
+        content_area,
+        "在 Codex 的控制设备设置中选择旋钮模式，也可把任一方向分配给自定义技能",
+        &desk_ui_font_16,
+        lv_color_hex(0x697581)
+    );
+    lv_obj_set_pos(hint, 18, 318);
+}
+
+#define CLAUDE_SESSION_CARD_COUNT 4
+
+static lv_obj_t *create_claude_session_card(size_t index, int32_t x, int32_t y)
+{
+    lv_obj_t *button = lv_button_create(content_area);
+    lv_obj_set_size(button, 378, 88);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x171D24), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x233746), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(button, 10, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x303844), 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_add_event_cb(
+        button,
+        action_button_callback,
+        LV_EVENT_CLICKED,
+        (void *)(uintptr_t)(DESK_UI_ACTION_CLAUDE_SESSION_1 + index)
+    );
+    bindings.ai_slot_button[index] = button;
+
+    bindings.ai_slot_name[index] = create_label(button, "未分配", &desk_ui_font_16, lv_color_hex(0xE8EDF2));
+    lv_obj_set_pos(bindings.ai_slot_name[index], 16, 18);
+    lv_obj_set_width(bindings.ai_slot_name[index], 346);
+    lv_label_set_long_mode(bindings.ai_slot_name[index], LV_LABEL_LONG_DOT);
+
+    /* 状态行合并“运行中 · 刚刚活动”，两行居中分布，避免时间贴底、上方留空。 */
+    bindings.ai_slot_status[index] = create_label(button, "暂无会话", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(bindings.ai_slot_status[index], 16, 50);
+    lv_obj_set_width(bindings.ai_slot_status[index], 346);
+    lv_label_set_long_mode(bindings.ai_slot_status[index], LV_LABEL_LONG_DOT);
+
+    bindings.ai_slot_detail[index] = NULL;  /* 时间并入状态行，无独立副文本。 */
+    return button;
+}
+
+static void create_claude_page(void)
+{
+    if (!app_state.ai.valid) {
+        lv_obj_t *empty = create_label(content_area, "Mac 未连接，Claude 状态已清除", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+        lv_obj_center(empty);
+        return;
+    }
+    bindings.ai_page_summary = create_label(content_area, "正在读取 Claude Code 会话", &desk_ui_font_16, lv_color_hex(0xD8A8FF));
+    lv_obj_set_pos(bindings.ai_page_summary, 18, 34);
+    lv_obj_t *detail = create_label(content_area, "最近会话按活跃排序，轻点卡片跳回该对话", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(detail, 18, 64);
+
+    static const int32_t card_x[CLAUDE_SESSION_CARD_COUNT] = {18, 404, 18, 404};
+    static const int32_t card_y[CLAUDE_SESSION_CARD_COUNT] = {96, 96, 194, 194};
+    for (size_t i = 0; i < CLAUDE_SESSION_CARD_COUNT; ++i) {
+        create_claude_session_card(i, card_x[i], card_y[i]);
+    }
+    /* 未使用的槽位绑定置空：refresh 遍历全部槽位时据此跳过，避免触碰上一页残留控件。 */
+    for (size_t i = CLAUDE_SESSION_CARD_COUNT; i < DESK_AI_TASK_SLOT_COUNT; ++i) {
+        bindings.ai_slot_button[i] = NULL;
+        bindings.ai_slot_name[i] = NULL;
+        bindings.ai_slot_status[i] = NULL;
+        bindings.ai_slot_detail[i] = NULL;
+    }
+    lv_obj_t *hint = create_label(content_area, "任务内容不发送到设备，仅同步会话名与活跃状态", &desk_ui_font_16, lv_color_hex(0x697581));
+    lv_obj_set_pos(hint, 18, 300);
+    refresh_claude_page();
 }
 
 static void refresh_media_page(void)
@@ -839,11 +1379,30 @@ static void refresh_media_page(void)
         return;
     }
 
+    set_label_text(bindings.media_source, app_state.media.source);
+    set_label_text(
+        bindings.media_status,
+        app_state.media.metadata_available ? (app_state.media.playing ? "正在播放" : "已暂停") : "当前无媒体"
+    );
+    if (bindings.media_status != NULL) {
+        lv_obj_set_style_text_color(
+            bindings.media_status,
+            app_state.media.playing ? lv_color_hex(0x72E0A8) : lv_color_hex(0x8E9AA8),
+            0
+        );
+    }
     set_label_text(
         bindings.media_title,
         app_state.media.title_hidden ? "媒体标题已隐藏" : app_state.media.title
     );
-    set_label_text(bindings.media_play_label, "播放/暂停");
+    set_label_text(
+        bindings.media_artist,
+        app_state.media.title_hidden ? "艺人信息已隐藏" :
+        (app_state.media.artist[0] != '\0' ? app_state.media.artist :
+         (app_state.media.metadata_available ? "未提供艺人信息" : "在 Mac 上开始播放后即可控制"))
+    );
+    set_label_text(bindings.media_play_label, app_state.media.playing ? "暂停" : "播放");
+    set_label_text(bindings.media_mute_label, app_state.media.muted ? "取消静音" : "静音");
 
     const int32_t duration = app_state.media.duration_seconds > (uint32_t)INT32_MAX
                                  ? INT32_MAX
@@ -854,25 +1413,50 @@ static void refresh_media_page(void)
     if (bindings.media_progress != NULL) {
         lv_bar_set_range(bindings.media_progress, 0, duration > 0 ? duration : 1);
         lv_bar_set_value(bindings.media_progress, position, LV_ANIM_OFF);
+        lv_obj_set_style_opa(
+            bindings.media_progress,
+            app_state.media.metadata_available && duration > 0 ? LV_OPA_COVER : LV_OPA_40,
+            0
+        );
     }
 
-    char time_text[24];
-    snprintf(
-        time_text,
-        sizeof(time_text),
-        "%02lu:%02lu",
-        (unsigned long)(app_state.media.position_seconds / 60U),
-        (unsigned long)(app_state.media.position_seconds % 60U)
-    );
-    set_label_text(bindings.media_position, time_text);
-    snprintf(
-        time_text,
-        sizeof(time_text),
-        "%02lu:%02lu",
-        (unsigned long)(app_state.media.duration_seconds / 60U),
-        (unsigned long)(app_state.media.duration_seconds % 60U)
-    );
-    set_label_text(bindings.media_duration, time_text);
+    char time_text[32];
+    if (!app_state.media.metadata_available) {
+        set_label_text(bindings.media_position, "--:--");
+        set_label_text(bindings.media_duration, "--:--");
+    } else if (app_state.media.duration_seconds == 0U) {
+        set_label_text(bindings.media_position, "--:--");
+        set_label_text(bindings.media_duration, "直播 / 未知时长");
+    } else {
+        snprintf(
+            time_text,
+            sizeof(time_text),
+            "%02lu:%02lu",
+            (unsigned long)(app_state.media.position_seconds / 60U),
+            (unsigned long)(app_state.media.position_seconds % 60U)
+        );
+        set_label_text(bindings.media_position, time_text);
+        snprintf(
+            time_text,
+            sizeof(time_text),
+            "%02lu:%02lu",
+            (unsigned long)(app_state.media.duration_seconds / 60U),
+            (unsigned long)(app_state.media.duration_seconds % 60U)
+        );
+        set_label_text(bindings.media_duration, time_text);
+    }
+    if (bindings.media_volume != NULL) {
+        lv_bar_set_value(
+            bindings.media_volume,
+            app_state.media.volume_percent <= 100U ? app_state.media.volume_percent : 100U,
+            LV_ANIM_OFF
+        );
+    }
+    snprintf(time_text, sizeof(time_text), "%u%%", app_state.media.volume_percent);
+    set_label_text(bindings.media_volume_value, time_text);
+    if (bindings.media_volume != NULL) {
+        lv_obj_set_style_opa(bindings.media_volume, app_state.media.muted ? LV_OPA_40 : LV_OPA_COVER, 0);
+    }
 }
 
 static void create_media_page(void)
@@ -883,56 +1467,82 @@ static void create_media_page(void)
         return;
     }
 
+    bindings.media_source = create_label(
+        content_area,
+        app_state.media.source,
+        &desk_ui_font_16,
+        lv_color_hex(0x72C7FF)
+    );
+    lv_obj_set_pos(bindings.media_source, 24, 18);
+    bindings.media_status = create_label(
+        content_area,
+        "等待播放",
+        &desk_ui_font_16,
+        lv_color_hex(0x8E9AA8)
+    );
+    lv_obj_align(bindings.media_status, LV_ALIGN_TOP_RIGHT, -24, 18);
+
     const char *media_title = app_state.media.title_hidden ? "媒体标题已隐藏" : app_state.media.title;
-    lv_obj_t *title = create_label(content_area, media_title, &desk_ui_font_16, lv_color_hex(0xDCE3EA));
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 42);
-    bindings.media_title = title;
-    create_action_button(content_area, 24, 118, "静音", DESK_UI_ACTION_MEDIA_MUTE);
-    create_action_button(content_area, 152, 118, "音量－", DESK_UI_ACTION_MEDIA_VOLUME_DOWN);
-    create_action_button(content_area, 280, 118, "上一个", DESK_UI_ACTION_MEDIA_PREVIOUS);
+    bindings.media_title = create_label(content_area, media_title, &desk_ui_font_16, lv_color_hex(0xF4F7FA));
+    lv_obj_set_pos(bindings.media_title, 24, 54);
+    lv_obj_set_width(bindings.media_title, 752);
+    lv_label_set_long_mode(bindings.media_title, LV_LABEL_LONG_MODE_DOTS);
+    bindings.media_artist = create_label(content_area, "", &desk_ui_font_16, lv_color_hex(0xA5AFBA));
+    lv_obj_set_pos(bindings.media_artist, 24, 86);
+    lv_obj_set_width(bindings.media_artist, 752);
+    lv_label_set_long_mode(bindings.media_artist, LV_LABEL_LONG_MODE_DOTS);
+
+    lv_obj_t *progress = lv_bar_create(content_area);
+    lv_obj_set_size(progress, 752, 8);
+    lv_obj_set_pos(progress, 24, 124);
+    lv_bar_set_range(progress, 0, 1);
+    lv_bar_set_value(progress, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(progress, lv_color_hex(0x303844), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(progress, lv_color_hex(0x72C7FF), LV_PART_INDICATOR);
+    bindings.media_progress = progress;
+
+    bindings.media_position = create_label(content_area, "00:00", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+    lv_obj_set_pos(bindings.media_position, 24, 142);
+    bindings.media_duration = create_label(content_area, "00:00", &desk_ui_font_16, lv_color_hex(0x8E9AA8));
+    lv_obj_set_width(bindings.media_duration, 200);
+    lv_obj_set_style_text_align(bindings.media_duration, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(bindings.media_duration, LV_ALIGN_TOP_RIGHT, -24, 142);
+
+    create_action_button(content_area, 208, 184, "上一个", DESK_UI_ACTION_MEDIA_PREVIOUS);
     lv_obj_t *play_button = create_action_button(
         content_area,
-        408,
-        118,
-        "播放/暂停",
+        344,
+        184,
+        "播放",
         DESK_UI_ACTION_MEDIA_PLAY_PAUSE
     );
     bindings.media_play_label = lv_obj_get_child(play_button, 0);
-    create_action_button(content_area, 536, 118, "下一个", DESK_UI_ACTION_MEDIA_NEXT);
-    create_action_button(content_area, 664, 118, "音量＋", DESK_UI_ACTION_MEDIA_VOLUME_UP);
+    create_action_button(content_area, 480, 184, "下一个", DESK_UI_ACTION_MEDIA_NEXT);
 
-    lv_obj_t *progress = lv_bar_create(content_area);
-    lv_obj_set_size(progress, 536, 10);
-    lv_obj_set_pos(progress, 132, 238);
-    lv_bar_set_range(progress, 0, 1);
-    lv_bar_set_value(progress, 0, LV_ANIM_OFF);
-    bindings.media_progress = progress;
-
-    char time_text[24];
-    snprintf(
-        time_text,
-        sizeof(time_text),
-        "%02lu:%02lu",
-        (unsigned long)(app_state.media.position_seconds / 60U),
-        (unsigned long)(app_state.media.position_seconds % 60U)
+    lv_obj_t *volume_title = create_label(
+        content_area, "系统音量", &desk_ui_font_16, lv_color_hex(0x8E9AA8)
     );
-    lv_obj_t *position_label = create_label(content_area, time_text, &lv_font_montserrat_14, lv_color_hex(0x8E9AA8));
-    lv_obj_set_pos(position_label, 132, 260);
-    bindings.media_position = position_label;
-    snprintf(
-        time_text,
-        sizeof(time_text),
-        "%02lu:%02lu",
-        (unsigned long)(app_state.media.duration_seconds / 60U),
-        (unsigned long)(app_state.media.duration_seconds % 60U)
+    lv_obj_set_pos(volume_title, 24, 302);
+    lv_obj_t *mute_button = create_compact_action_button(
+        content_area, 112, 290, 112, "静音", DESK_UI_ACTION_MEDIA_MUTE
     );
-    lv_obj_t *duration_label = create_label(content_area, time_text, &lv_font_montserrat_14, lv_color_hex(0x8E9AA8));
-    lv_obj_align(duration_label, LV_ALIGN_TOP_RIGHT, -132, 260);
-    bindings.media_duration = duration_label;
+    bindings.media_mute_label = lv_obj_get_child(mute_button, 0);
+    create_compact_action_button(content_area, 238, 290, 100, "音量－", DESK_UI_ACTION_MEDIA_VOLUME_DOWN);
+    bindings.media_volume = lv_bar_create(content_area);
+    lv_obj_set_size(bindings.media_volume, 250, 10);
+    lv_obj_set_pos(bindings.media_volume, 354, 305);
+    lv_bar_set_range(bindings.media_volume, 0, 100);
+    lv_obj_set_style_bg_color(bindings.media_volume, lv_color_hex(0x303844), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bindings.media_volume, lv_color_hex(0x72E0A8), LV_PART_INDICATOR);
+    bindings.media_volume_value = create_label(
+        content_area, "0%", &lv_font_montserrat_14, lv_color_hex(0xDCE3EA)
+    );
+    lv_obj_set_pos(bindings.media_volume_value, 618, 299);
+    create_compact_action_button(content_area, 678, 290, 100, "音量＋", DESK_UI_ACTION_MEDIA_VOLUME_UP);
     refresh_media_page();
 }
 
-static void create_information_card(
+static lv_obj_t *create_information_card(
     int32_t x,
     int32_t y,
     int32_t width,
@@ -956,7 +1566,7 @@ static void create_information_card(
     lv_obj_t *value = create_label(card, "--", &desk_ui_font_16, lv_color_hex(0xF4F7FA));
     lv_obj_set_pos(value, 18, diagnostics ? 58 : 62);
     lv_obj_t *detail = create_label(card, "--", &desk_ui_font_16, lv_color_hex(0x72C7FF));
-    lv_obj_set_pos(detail, 18, diagnostics ? 100 : 112);
+    lv_obj_set_pos(detail, 18, diagnostics ? 86 : 96);
     lv_obj_set_width(detail, width - 36);
     lv_label_set_long_mode(detail, LV_LABEL_LONG_MODE_DOTS);
 
@@ -967,6 +1577,56 @@ static void create_information_card(
         bindings.settings_value[binding_index] = value;
         bindings.settings_detail[binding_index] = detail;
     }
+    return card;
+}
+
+static void format_data_age(uint32_t epoch, char *output, size_t output_capacity)
+{
+    const time_t now = time(NULL);
+    if (epoch == 0 || now < (time_t)epoch) {
+        snprintf(output, output_capacity, "%s", "等待首次更新");
+        return;
+    }
+    const uint32_t seconds = (uint32_t)(now - (time_t)epoch);
+    if (seconds < 60U) {
+        snprintf(output, output_capacity, "%s", "刚刚更新");
+    } else if (seconds < 3600U) {
+        snprintf(output, output_capacity, "%lu 分钟前", (unsigned long)(seconds / 60U));
+    } else {
+        snprintf(output, output_capacity, "%lu 小时前", (unsigned long)(seconds / 3600U));
+    }
+}
+
+static const char *wifi_signal_text(int8_t rssi_dbm)
+{
+    if (rssi_dbm >= -55) {
+        return "信号优秀";
+    }
+    if (rssi_dbm >= -67) {
+        return "信号良好";
+    }
+    if (rssi_dbm >= -75) {
+        return "信号一般";
+    }
+    return "信号较弱";
+}
+
+static const char *wifi_disconnect_text(uint8_t reason)
+{
+    switch (reason) {
+        case 201:
+            return "未找到已保存的网络";
+        case 202:
+            return "Wi-Fi 认证失败";
+        case 203:
+            return "无法关联到路由器";
+        case 204:
+            return "Wi-Fi 握手超时";
+        case 205:
+            return "Wi-Fi 连接失败";
+        default:
+            return reason == 0U ? "等待网络连接" : "Wi-Fi 连接已断开";
+    }
 }
 
 static void refresh_settings_page(void)
@@ -974,42 +1634,93 @@ static void refresh_settings_page(void)
     char value[96];
     char detail[96];
     if (app_state.connection.wifi_connected) {
-        snprintf(value, sizeof(value), "已连接  ·  %d dBm", app_state.connection.wifi_rssi_dbm);
+        snprintf(
+            value,
+            sizeof(value),
+            "%s  ·  %s",
+            app_state.device.wifi_ssid[0] != '\0' ? app_state.device.wifi_ssid : "Wi-Fi 在线",
+            wifi_signal_text(app_state.connection.wifi_rssi_dbm)
+        );
         snprintf(
             detail,
             sizeof(detail),
-            "IP %s",
-            app_state.connection.wifi_ipv4[0] != '\0' ? app_state.connection.wifi_ipv4 : "获取中"
+            "%s  ·  %d dBm",
+            app_state.connection.wifi_ipv4[0] != '\0' ? app_state.connection.wifi_ipv4 : "正在获取地址",
+            app_state.connection.wifi_rssi_dbm
         );
     } else {
-        snprintf(value, sizeof(value), "%s", "未连接");
-        snprintf(detail, sizeof(detail), "%s", "请在 Mac 助手中配置 2.4GHz Wi-Fi");
+        snprintf(
+            value,
+            sizeof(value),
+            "%s  ·  离线",
+            app_state.device.wifi_ssid[0] != '\0' ? app_state.device.wifi_ssid : "Wi-Fi"
+        );
+        if (app_state.device.wifi_credentials_available) {
+            snprintf(
+                detail,
+                sizeof(detail),
+                "%s  ·  第 %lu 次重试",
+                wifi_disconnect_text(app_state.device.wifi_last_disconnect_reason),
+                (unsigned long)app_state.device.wifi_reconnect_attempts
+            );
+        } else {
+            snprintf(detail, sizeof(detail), "%s", "请在 Mac 助手中配置 2.4GHz Wi-Fi");
+        }
     }
     set_label_text(bindings.settings_value[0], value);
     set_label_text(bindings.settings_detail[0], detail);
 
-    snprintf(
-        value,
-        sizeof(value),
-        "%s",
-        app_state.connection.mac_authenticated ? "Mac 已认证" :
-        (app_state.connection.ble_connected ? "蓝牙已连接，等待认证" : "蓝牙未连接")
-    );
+    if (app_state.connection.mac_authenticated) {
+        snprintf(value, sizeof(value), "Mac 已认证  ·  MTU %u", app_state.device.ble_mtu);
+        const uint32_t heartbeat_ms = app_state.device.heartbeat_age_ms;
+        snprintf(
+            detail,
+            sizeof(detail),
+            "心跳 %lu.%lu 秒  ·  %s",
+            (unsigned long)(heartbeat_ms / 1000U),
+            (unsigned long)((heartbeat_ms % 1000U) / 100U),
+            app_state.device.ble_bonded ? "系统已绑定" : "等待系统绑定"
+        );
+    } else {
+        snprintf(
+            value,
+            sizeof(value),
+            "%s",
+            app_state.connection.ble_connected ? "蓝牙已连接，等待认证" : "蓝牙未连接"
+        );
+        snprintf(detail, sizeof(detail), "%s", "加密认证后亮屏  ·  断开立即熄屏");
+    }
     set_label_text(bindings.settings_value[1], value);
-    set_label_text(bindings.settings_detail[1], "断开连接或心跳超时后立即熄屏");
+    set_label_text(bindings.settings_detail[1], detail);
 
+    char weather_age[32];
+    char market_age[32];
+    format_data_age(app_state.weather.updated_at_epoch, weather_age, sizeof(weather_age));
+    format_data_age(app_state.market.updated_at_epoch, market_age, sizeof(market_age));
     snprintf(
         value,
         sizeof(value),
         "天气 %s  ·  行情 %s",
-        app_state.weather.valid ? "正常" : "待配置",
-        app_state.market.valid ? "正常" : "等待联网"
+        app_state.weather.valid ? "正常" : "等待",
+        app_state.market.valid ? "正常" : "等待"
     );
     set_label_text(bindings.settings_value[2], value);
-    set_label_text(bindings.settings_detail[2], "公共数据由设备通过 HTTPS 直接获取");
+    snprintf(detail, sizeof(detail), "天气 %s  ·  行情 %s", weather_age, market_age);
+    set_label_text(bindings.settings_detail[2], detail);
 
-    set_label_text(bindings.settings_value[3], "横屏 800×480  ·  深色主题");
-    set_label_text(bindings.settings_detail[3], "通知正文隐藏，私密状态断连后清除");
+    set_label_text(bindings.settings_value[3], "隐私保护已启用");
+    set_label_text(
+        bindings.settings_detail[3],
+        app_state.media.title_hidden ? "媒体标题已隐藏  ·  私密状态断连清除" :
+                                       "媒体标题可见  ·  私密状态断连清除"
+    );
+    set_label_text(
+        bindings.settings_action_label[3],
+        app_state.media.title_hidden ? "显示标题" : "隐藏标题"
+    );
+    set_button_enabled(bindings.settings_action[0], true);
+    set_button_enabled(bindings.settings_action[1], app_state.connection.mac_authenticated);
+    set_button_enabled(bindings.settings_action[2], app_state.connection.wifi_connected);
 }
 
 static void create_settings_page(void)
@@ -1018,7 +1729,29 @@ static void create_settings_page(void)
     for (size_t i = 0; i < 4; ++i) {
         const int32_t x = 18 + (int32_t)(i % 2U) * 391;
         const int32_t y = 18 + (int32_t)(i / 2U) * 187;
-        create_information_card(x, y, 373, 169, titles[i], i, false);
+        lv_obj_t *card = create_information_card(x, y, 373, 169, titles[i], i, false);
+        if (i == 0U) {
+            lv_obj_set_width(bindings.settings_detail[i], 220);
+            bindings.settings_action[i] = create_compact_action_button(
+                card, 243, 113, 112, "重新连接", DESK_UI_ACTION_WIFI_RECONNECT
+            );
+        } else if (i == 1U) {
+            lv_obj_set_width(bindings.settings_detail[i], 220);
+            bindings.settings_action[i] = create_compact_action_button(
+                card, 243, 113, 112, "Mac 设置", DESK_UI_ACTION_OPEN_MAC_HELPER
+            );
+        } else if (i == 2U) {
+            lv_obj_set_width(bindings.settings_detail[i], 220);
+            bindings.settings_action[i] = create_compact_action_button(
+                card, 243, 113, 112, "立即刷新", DESK_UI_ACTION_PUBLIC_REFRESH
+            );
+        } else if (i == 3U) {
+            lv_obj_set_width(bindings.settings_detail[i], 220);
+            bindings.settings_action[i] = create_compact_action_button(
+                card, 243, 113, 112, "隐藏标题", DESK_UI_ACTION_MEDIA_TITLE_TOGGLE
+            );
+            bindings.settings_action_label[i] = lv_obj_get_child(bindings.settings_action[i], 0);
+        }
     }
     refresh_settings_page();
 }
@@ -1040,42 +1773,113 @@ static void refresh_diagnostics_page(void)
     const desk_device_state_t *device = &app_state.device;
     char value[80];
     char detail[96];
+    char uptime[32];
 
     snprintf(value, sizeof(value), "固件 %s", device->firmware_version[0] != '\0' ? device->firmware_version : "unknown");
     set_label_text(bindings.diagnostic_value[0], value);
-    set_label_text(bindings.diagnostic_detail[0], device->board_name[0] != '\0' ? device->board_name : "ESP32-S3");
+    format_uptime(device->uptime_seconds, uptime, sizeof(uptime));
+    snprintf(
+        detail,
+        sizeof(detail),
+        "%.31s  ·  运行 %.31s",
+        device->board_name[0] != '\0' ? device->board_name : "ESP32-S3",
+        uptime
+    );
+    set_label_text(bindings.diagnostic_detail[0], detail);
 
-    format_uptime(device->uptime_seconds, value, sizeof(value));
+    snprintf(
+        value,
+        sizeof(value),
+        "内部 %lu KB  ·  PSRAM %lu KB",
+        (unsigned long)device->free_internal_kb,
+        (unsigned long)device->free_psram_kb
+    );
     set_label_text(bindings.diagnostic_value[1], value);
-    set_label_text(bindings.diagnostic_detail[1], "每 5 秒刷新");
+    snprintf(detail, sizeof(detail), "最大连续内存块 %lu KB", (unsigned long)device->largest_internal_block_kb);
+    set_label_text(bindings.diagnostic_detail[1], detail);
 
-    snprintf(value, sizeof(value), "%lu KB 可用", (unsigned long)device->free_internal_kb);
-    snprintf(detail, sizeof(detail), "最大连续块 %lu KB", (unsigned long)device->largest_internal_block_kb);
+    snprintf(
+        value,
+        sizeof(value),
+        "Wi-Fi %s  ·  蓝牙 %s",
+        app_state.connection.wifi_connected ? "正常" : "离线",
+        app_state.connection.mac_authenticated ? "正常" : "未认证"
+    );
     set_label_text(bindings.diagnostic_value[2], value);
+    if (app_state.connection.wifi_connected) {
+        snprintf(
+            detail,
+            sizeof(detail),
+            "%s  ·  心跳 %lu.%lu 秒",
+            app_state.connection.wifi_ipv4,
+            (unsigned long)(device->heartbeat_age_ms / 1000U),
+            (unsigned long)((device->heartbeat_age_ms % 1000U) / 100U)
+        );
+    } else {
+        snprintf(detail, sizeof(detail), "%s", wifi_disconnect_text(device->wifi_last_disconnect_reason));
+    }
     set_label_text(bindings.diagnostic_detail[2], detail);
 
-    snprintf(value, sizeof(value), "%lu KB 可用", (unsigned long)device->free_psram_kb);
+    snprintf(
+        value,
+        sizeof(value),
+        "%s  ·  日志 %lu 条",
+        device->storage_mounted ? "microSD 正常" : "microSD 未就绪",
+        (unsigned long)device->log_written_entries
+    );
     set_label_text(bindings.diagnostic_value[3], value);
-    set_label_text(bindings.diagnostic_detail[3], "图形缓冲与网络响应优先使用 PSRAM");
+    snprintf(
+        detail,
+        sizeof(detail),
+        "排队 %lu  ·  丢弃 %lu  ·  状态码 %ld",
+        (unsigned long)device->log_queued_entries,
+        (unsigned long)device->log_dropped_entries,
+        (long)device->storage_last_error
+    );
+    set_label_text(bindings.diagnostic_detail[3], detail);
 
-    set_label_text(bindings.diagnostic_value[4], device->storage_mounted ? "microSD 已挂载" : "microSD 未就绪");
-    snprintf(detail, sizeof(detail), "最近状态码 %ld", (long)device->storage_last_error);
-    set_label_text(bindings.diagnostic_detail[4], detail);
-
-    snprintf(value, sizeof(value), "%lu 条已写入", (unsigned long)device->log_written_entries);
-    snprintf(detail, sizeof(detail), "%lu 条丢弃", (unsigned long)device->log_dropped_entries);
-    set_label_text(bindings.diagnostic_value[5], value);
-    set_label_text(bindings.diagnostic_detail[5], detail);
+    const bool healthy = device->largest_internal_block_kb >= 32U &&
+                         device->free_internal_kb >= 64U &&
+                         device->storage_mounted &&
+                         device->log_dropped_entries == 0U &&
+                         app_state.connection.wifi_connected &&
+                         app_state.connection.mac_authenticated;
+    snprintf(
+        value,
+        sizeof(value),
+        "%s  ·  已记录 %lu 份诊断快照",
+        healthy ? "设备状态正常" : "有项目需要检查",
+        (unsigned long)device->diagnostic_snapshots
+    );
+    set_label_text(bindings.diagnostic_summary, value);
+    if (bindings.diagnostic_summary != NULL) {
+        lv_obj_set_style_text_color(
+            bindings.diagnostic_summary,
+            healthy ? lv_color_hex(0x72E0A8) : lv_color_hex(0xF2BE63),
+            0
+        );
+    }
+    set_button_enabled(bindings.diagnostic_snapshot, device->storage_mounted);
 }
 
 static void create_diagnostics_page(void)
 {
-    static const char *const titles[] = {"设备", "运行时间", "内部内存", "PSRAM", "存储卡", "日志"};
-    for (size_t i = 0; i < 6; ++i) {
-        const int32_t x = 16 + (int32_t)(i % 3U) * 261;
-        const int32_t y = 18 + (int32_t)(i / 3U) * 187;
-        create_information_card(x, y, 245, 169, titles[i], i, true);
+    static const char *const titles[] = {"设备", "内存", "连接", "存储与日志"};
+    for (size_t i = 0; i < 4; ++i) {
+        const int32_t x = 18 + (int32_t)(i % 2U) * 391;
+        const int32_t y = 12 + (int32_t)(i / 2U) * 157;
+        create_information_card(x, y, 373, 145, titles[i], i, true);
     }
+    bindings.diagnostic_summary = create_label(
+        content_area, "正在读取设备状态", &desk_ui_font_16, lv_color_hex(0x8E9AA8)
+    );
+    lv_obj_set_pos(bindings.diagnostic_summary, 20, 337);
+    bindings.diagnostic_refresh = create_compact_action_button(
+        content_area, 520, 326, 116, "立即刷新", DESK_UI_ACTION_DIAGNOSTIC_REFRESH
+    );
+    bindings.diagnostic_snapshot = create_compact_action_button(
+        content_area, 650, 326, 130, "记录诊断", DESK_UI_ACTION_DIAGNOSTIC_SNAPSHOT
+    );
     refresh_diagnostics_page();
 }
 
@@ -1147,6 +1951,19 @@ static void refresh_status_bar(void)
     set_label_text(bindings.connection_status, connections);
 }
 
+static void secondary_page_back_callback(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        if (current_page == PAGE_CODEX_COMMANDS) {
+            render_page(PAGE_CODEX);
+        } else if (current_page == PAGE_CODEX_NAVIGATION) {
+            render_page(PAGE_CODEX_COMMANDS);
+        } else {
+            render_page(current_page == PAGE_CODEX || current_page == PAGE_CLAUDE ? PAGE_AI : PAGE_LIBRARY);
+        }
+    }
+}
+
 static void create_status_bar(void)
 {
     lv_obj_t *status_bar = lv_obj_create(root_screen);
@@ -1156,8 +1973,26 @@ static void create_status_bar(void)
     lv_obj_set_style_bg_color(status_bar, lv_color_hex(0x171C22), 0);
     lv_obj_set_style_bg_opa(status_bar, LV_OPA_COVER, 0);
 
+    int32_t title_x = 16;
+    if (current_page == PAGE_SETTINGS || current_page == PAGE_DIAGNOSTICS ||
+        current_page == PAGE_CODEX || current_page == PAGE_CODEX_COMMANDS ||
+        current_page == PAGE_CODEX_NAVIGATION || current_page == PAGE_CLAUDE) {
+        lv_obj_t *back = lv_button_create(status_bar);
+        remove_all_styles(back);
+        lv_obj_set_size(back, 64, STATUS_BAR_HEIGHT);
+        lv_obj_set_pos(back, 8, 0);
+        lv_obj_set_style_bg_color(back, lv_color_hex(0x233746), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(back, LV_OPA_COVER, LV_STATE_PRESSED);
+        lv_obj_set_style_radius(back, 6, LV_STATE_PRESSED);
+        lv_obj_add_event_cb(back, secondary_page_back_callback, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *back_label = create_label(back, "返回", &desk_ui_font_16, lv_color_hex(0x72C7FF));
+        lv_obj_center(back_label);
+        title_x = 82;
+    }
+
     lv_obj_t *title = create_label(status_bar, PAGE_TITLES[current_page], &desk_ui_font_16, lv_color_hex(0xB9C3CD));
-    lv_obj_set_pos(title, 16, 2);
+    lv_obj_set_pos(title, title_x, 2);
 
     char connections[96];
     snprintf(
@@ -1183,7 +2018,11 @@ static void create_dock(void)
     lv_obj_set_style_bg_color(dock, lv_color_hex(0x171C22), 0);
     lv_obj_set_style_bg_opa(dock, LV_OPA_COVER, 0);
 
-    const page_id_t selected_page = current_page >= PAGE_LIBRARY ? PAGE_LIBRARY : current_page;
+    const page_id_t selected_page =
+        current_page == PAGE_CODEX || current_page == PAGE_CODEX_COMMANDS ||
+                current_page == PAGE_CODEX_NAVIGATION || current_page == PAGE_CLAUDE
+            ? PAGE_AI
+            : (current_page >= PAGE_LIBRARY ? PAGE_LIBRARY : current_page);
     for (int i = 0; i < DOCK_PAGE_COUNT; ++i) {
         lv_obj_t *button = lv_button_create(dock);
         lv_obj_set_size(button, 104, 48);
@@ -1221,7 +2060,12 @@ static void refresh_current_page(void)
             refresh_control_page();
             break;
         case PAGE_AI:
+        case PAGE_CODEX:
+        case PAGE_CLAUDE:
             refresh_ai_page();
+            break;
+        case PAGE_CODEX_COMMANDS:
+        case PAGE_CODEX_NAVIGATION:
             break;
         case PAGE_MEDIA:
             refresh_media_page();
@@ -1246,7 +2090,12 @@ static bool page_shape_changed(const desk_app_state_t *before, const desk_app_st
         case PAGE_SYSTEM:
             return before->system.valid != after->system.valid;
         case PAGE_AI:
+        case PAGE_CODEX:
+        case PAGE_CLAUDE:
             return before->ai.valid != after->ai.valid;
+        case PAGE_CODEX_COMMANDS:
+        case PAGE_CODEX_NAVIGATION:
+            return false;
         case PAGE_MEDIA:
             return before->media.valid != after->media.valid;
         case PAGE_MARKET:
@@ -1276,6 +2125,11 @@ static void render_page(page_id_t page)
     }
 
     current_page = page;
+    if (feedback_timer != NULL) {
+        lv_timer_delete(feedback_timer);
+        feedback_timer = NULL;
+    }
+    feedback_panel = NULL;
     clock_label = NULL;
     date_label = NULL;
     if (clock_timer != NULL) {
@@ -1324,6 +2178,18 @@ static void render_page(page_id_t page)
             break;
         case PAGE_DIAGNOSTICS:
             create_diagnostics_page();
+            break;
+        case PAGE_CODEX:
+            create_codex_page();
+            break;
+        case PAGE_CODEX_COMMANDS:
+            create_codex_commands_page();
+            break;
+        case PAGE_CODEX_NAVIGATION:
+            create_codex_navigation_page();
+            break;
+        case PAGE_CLAUDE:
+            create_claude_page();
             break;
         default:
             break;

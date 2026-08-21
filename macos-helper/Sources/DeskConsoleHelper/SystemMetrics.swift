@@ -1,4 +1,5 @@
 import Darwin
+import AppKit
 import Foundation
 import CoreAudio
 import IOKit.ps
@@ -27,21 +28,298 @@ struct DeskControlLayoutSnapshot: Encodable {
 }
 
 struct DeskMediaSnapshot: Encodable {
-    let valid = true
-    let playing = false
-    let titleHidden = false
+    let valid: Bool
+    let metadataAvailable: Bool
+    let playing: Bool
+    let titleHidden: Bool
+    let muted: Bool
     let volume: UInt8
-    let position: UInt32 = 0
-    let duration: UInt32 = 0
-    let title = "Mac 当前媒体"
+    let position: UInt32
+    let duration: UInt32
+    let title: String
+    let artist: String
+    let source: String
+}
+
+private struct DeskMediaBridgePayload: Decodable {
+    let title: String?
+    let artist: String?
+    let source: String?
+    let playing: Bool?
+    let position: Double?
+    let duration: Double?
 }
 
 final class DeskMediaStateSampler {
+    private static let hideTitlesKey = "desk.media.hideTitles"
+    private let bridgeQueue = DispatchQueue(
+        label: "com.dongyu.desk-console-helper.media-snapshot",
+        qos: .utility
+    )
+    private let stateLock = NSLock()
+    private var cachedMetadata: DeskMediaBridgePayload?
+    private var cachedMetadataAt: TimeInterval = 0
+    private var refreshInFlight = false
+    private var lastRefreshAt: TimeInterval = 0
+    private var volumeBeforeFallbackMute: Float32?
+
     func sample() -> DeskMediaSnapshot {
-        DeskMediaSnapshot(volume: outputVolumePercent())
+        requestMetadataRefreshIfNeeded()
+        stateLock.lock()
+        let metadata = cachedMetadata
+        let metadataAt = cachedMetadataAt
+        stateLock.unlock()
+
+        let rawTitle = metadata?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let rawArtist = metadata?.artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasMetadata = !rawTitle.isEmpty
+        let titlesHidden = UserDefaults.standard.bool(forKey: Self.hideTitlesKey)
+        let duration = clampedSeconds(metadata?.duration)
+        var rawPosition = metadata?.position ?? 0
+        if metadata?.playing == true, metadataAt > 0 {
+            rawPosition += max(0, ProcessInfo.processInfo.systemUptime - metadataAt)
+        }
+        let position = min(clampedSeconds(rawPosition), duration > 0 ? duration : UInt32.max)
+        return DeskMediaSnapshot(
+            valid: true,
+            metadataAvailable: hasMetadata,
+            playing: metadata?.playing ?? false,
+            titleHidden: titlesHidden,
+            muted: outputMuted(),
+            volume: outputVolumePercent(),
+            position: position,
+            duration: duration,
+            title: titlesHidden ? "媒体标题已隐藏" :
+                (hasMetadata ? limitedUTF8(rawTitle, maximumBytes: 95) : "当前没有播放内容"),
+            artist: titlesHidden ? "" : limitedUTF8(rawArtist, maximumBytes: 63),
+            source: displayName(for: metadata?.source)
+        )
+    }
+
+    func toggleTitleVisibility() {
+        let hidden = UserDefaults.standard.bool(forKey: Self.hideTitlesKey)
+        UserDefaults.standard.set(!hidden, forKey: Self.hideTitlesKey)
+    }
+
+    @discardableResult
+    func adjustVolume(by delta: Float32) -> Bool {
+        guard let device = defaultOutputDevice(), var currentVolume = currentVolumeScalar(device: device) else {
+            return false
+        }
+
+        stateLock.lock()
+        if let volumeBeforeFallbackMute {
+            currentVolume = volumeBeforeFallbackMute
+            self.volumeBeforeFallbackMute = nil
+        }
+        stateLock.unlock()
+
+        let target = max(0, min(1, currentVolume + delta))
+        let changed = setVolumeScalar(device: device, value: target)
+        if changed {
+            _ = setMuted(device: device, muted: false)
+        }
+        return changed
+    }
+
+    @discardableResult
+    func toggleMute() -> Bool {
+        guard let device = defaultOutputDevice() else {
+            return false
+        }
+
+        if let muted = currentHardwareMute(device: device), setMuted(device: device, muted: !muted) {
+            return true
+        }
+
+        guard let currentVolume = currentVolumeScalar(device: device) else {
+            return false
+        }
+        stateLock.lock()
+        let savedVolume = volumeBeforeFallbackMute
+        stateLock.unlock()
+
+        if let savedVolume {
+            guard setVolumeScalar(device: device, value: savedVolume) else {
+                return false
+            }
+            stateLock.lock()
+            volumeBeforeFallbackMute = nil
+            stateLock.unlock()
+            return true
+        }
+
+        guard setVolumeScalar(device: device, value: 0) else {
+            return false
+        }
+        stateLock.lock()
+        volumeBeforeFallbackMute = max(currentVolume, 0.5)
+        stateLock.unlock()
+        return true
+    }
+
+    private func requestMetadataRefreshIfNeeded() {
+        let now = ProcessInfo.processInfo.systemUptime
+        stateLock.lock()
+        guard !refreshInFlight, now - lastRefreshAt >= 3.5 else {
+            stateLock.unlock()
+            return
+        }
+        refreshInFlight = true
+        lastRefreshAt = now
+        stateLock.unlock()
+
+        bridgeQueue.async { [weak self] in
+            let metadata = self?.readMediaBridge()
+            guard let self else {
+                return
+            }
+            self.stateLock.lock()
+            if let metadata {
+                self.cachedMetadata = metadata
+                self.cachedMetadataAt = ProcessInfo.processInfo.systemUptime
+            }
+            self.refreshInFlight = false
+            self.stateLock.unlock()
+        }
+    }
+
+    private func readMediaBridge() -> DeskMediaBridgePayload? {
+        guard let bridgeURL = Bundle.main.resourceURL?
+            .appendingPathComponent("DeskMediaBridge.dylib"),
+              FileManager.default.fileExists(atPath: bridgeURL.path) else {
+            return nil
+        }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.arguments = [
+            "-e",
+            "use DynaLoader; my $h=DynaLoader::dl_load_file($ARGV[0], 1) or die DynaLoader::dl_error(); " +
+            "my $s=DynaLoader::dl_find_symbol($h, 'desk_media_snapshot') or die DynaLoader::dl_error(); " +
+            "DynaLoader::dl_install_xsub('DeskMedia::snapshot', $s); DeskMedia::snapshot();",
+            bridgeURL.path,
+        ]
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return try? JSONDecoder().decode(DeskMediaBridgePayload.self, from: data)
+    }
+
+    private func clampedSeconds(_ value: Double?) -> UInt32 {
+        guard let value, value.isFinite, value > 0 else {
+            return 0
+        }
+        return UInt32(min(Double(UInt32.max), value.rounded(.down)))
+    }
+
+    private func limitedUTF8(_ value: String, maximumBytes: Int) -> String {
+        var result = ""
+        for character in value {
+            let candidate = result + String(character)
+            if candidate.lengthOfBytes(using: .utf8) > maximumBytes {
+                break
+            }
+            result = candidate
+        }
+        return result
+    }
+
+    private func displayName(for bundleIdentifier: String?) -> String {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else {
+            return "Mac 媒体"
+        }
+        let knownSources = [
+            "com.apple.Music": "音乐",
+            "com.spotify.client": "Spotify",
+            "com.apple.Safari": "Safari",
+            "com.google.Chrome": "Chrome",
+            "com.microsoft.edgemac": "Edge",
+            "org.mozilla.firefox": "Firefox",
+        ]
+        return knownSources[bundleIdentifier] ??
+            (NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first?.localizedName ?? "Mac 媒体")
     }
 
     private func outputVolumePercent() -> UInt8 {
+        guard let device = defaultOutputDevice(), let scalar = currentVolumeScalar(device: device) else {
+            return 50
+        }
+        return UInt8(max(0, min(100, Int((scalar * 100).rounded()))))
+    }
+
+    private func outputMuted() -> Bool {
+        guard let device = defaultOutputDevice() else {
+            return false
+        }
+        if currentHardwareMute(device: device) == true {
+            return true
+        }
+        stateLock.lock()
+        let fallbackMuted = volumeBeforeFallbackMute != nil
+        stateLock.unlock()
+        return fallbackMuted
+    }
+
+    private func currentHardwareMute(device: AudioObjectID) -> Bool? {
+        var found = false
+        for element in [kAudioObjectPropertyElementMain, 1, 2] {
+            if let muted = readMuted(device: device, element: element) {
+                found = true
+                if muted {
+                    return true
+                }
+            }
+        }
+        return found ? false : nil
+    }
+
+    private func currentVolumeScalar(device: AudioObjectID) -> Float32? {
+        if let master = readVolumeScalar(device: device, element: kAudioObjectPropertyElementMain) {
+            return master
+        }
+        let channels = [AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)].compactMap {
+            readVolumeScalar(device: device, element: $0)
+        }
+        guard !channels.isEmpty else {
+            return nil
+        }
+        return channels.reduce(0, +) / Float32(channels.count)
+    }
+
+    private func setVolumeScalar(device: AudioObjectID, value: Float32) -> Bool {
+        if writeVolumeScalar(device: device, element: kAudioObjectPropertyElementMain, value: value) {
+            return true
+        }
+        var changed = false
+        for element in [AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)] {
+            changed = writeVolumeScalar(device: device, element: element, value: value) || changed
+        }
+        return changed
+    }
+
+    private func setMuted(device: AudioObjectID, muted: Bool) -> Bool {
+        if writeMuted(device: device, element: kAudioObjectPropertyElementMain, muted: muted) {
+            return true
+        }
+        var changed = false
+        for element in [AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)] {
+            changed = writeMuted(device: device, element: element, muted: muted) || changed
+        }
+        return changed
+    }
+
+    private func defaultOutputDevice() -> AudioObjectID? {
         var device = AudioObjectID(kAudioObjectUnknown)
         var propertySize = UInt32(MemoryLayout<AudioObjectID>.size)
         var address = AudioObjectPropertyAddress(
@@ -57,27 +335,87 @@ final class DeskMediaStateSampler {
             &propertySize,
             &device
         ) == noErr, device != kAudioObjectUnknown else {
-            return 50
+            return nil
         }
+        return device
+    }
 
-        var scalar = Float32(0.5)
-        propertySize = UInt32(MemoryLayout<Float32>.size)
-        address = AudioObjectPropertyAddress(
+    private func readVolumeScalar(device: AudioObjectID, element: AudioObjectPropertyElement) -> Float32? {
+        var scalar = Float32(0)
+        var propertySize = UInt32(MemoryLayout<Float32>.size)
+        var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioDevicePropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
+            mElement: element
         )
-        guard AudioObjectGetPropertyData(
+        guard AudioObjectHasProperty(device, &address),
+              AudioObjectGetPropertyData(device, &address, 0, nil, &propertySize, &scalar) == noErr else {
+            return nil
+        }
+        return scalar
+    }
+
+    private func readMuted(device: AudioObjectID, element: AudioObjectPropertyElement) -> Bool? {
+        var muted: UInt32 = 0
+        var propertySize = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(device, &address),
+              AudioObjectGetPropertyData(device, &address, 0, nil, &propertySize, &muted) == noErr else {
+            return nil
+        }
+        return muted != 0
+    }
+
+    private func writeVolumeScalar(
+        device: AudioObjectID,
+        element: AudioObjectPropertyElement,
+        value: Float32
+    ) -> Bool {
+        var scalar = max(0, min(1, value))
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(device, &address) else {
+            return false
+        }
+        return AudioObjectSetPropertyData(
             device,
             &address,
             0,
             nil,
-            &propertySize,
+            UInt32(MemoryLayout<Float32>.size),
             &scalar
-        ) == noErr else {
-            return 50
+        ) == noErr
+    }
+
+    private func writeMuted(
+        device: AudioObjectID,
+        element: AudioObjectPropertyElement,
+        muted: Bool
+    ) -> Bool {
+        var rawValue: UInt32 = muted ? 1 : 0
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        guard AudioObjectHasProperty(device, &address) else {
+            return false
         }
-        return UInt8(max(0, min(100, Int((scalar * 100).rounded()))))
+        return AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<UInt32>.size),
+            &rawValue
+        ) == noErr
     }
 }
 

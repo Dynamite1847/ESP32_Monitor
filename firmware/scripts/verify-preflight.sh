@@ -22,14 +22,7 @@ while IFS= read -r glyph; do
         missing_glyphs="${missing_glyphs}${glyph}"
     fi
 done < <(
-    while IFS= read -r source_file; do
-        rg --no-filename -oP '[\x{3400}-\x{9FFF}]' "${source_file}" || true
-    done < <(
-        rg --files \
-            "${FIRMWARE_DIR}/components/ui" \
-            "${FIRMWARE_DIR}/components/app_model" \
-            -g '*.c' -g '*.h' -g '*.txt' -g '!desk_ui_font_16.c' -g '!desk_ui_cjk_font_16.c'
-    ) | LC_ALL=C sort -u
+    python3 "${SCRIPT_DIR}/extract-ui-han.py"
 )
 if [[ -n "${missing_glyphs}" ]]; then
     echo "界面字体缺少汉字：${missing_glyphs}" >&2

@@ -8,22 +8,22 @@ enum DeskAuthenticationError: LocalizedError {
     case invalidResult
     case rejected(UInt8)
     case randomGenerationFailed(OSStatus)
-    case keychain(OSStatus)
+    case storage(Error)
 
     var errorDescription: String? {
         switch self {
         case .invalidChallenge:
             return "设备认证挑战无效"
         case .missingSharedKey:
-            return "Mac 钥匙串中没有设备密钥"
+            return "Mac 本地没有设备认证密钥"
         case .invalidResult:
             return "设备认证结果无效"
         case let .rejected(code):
             return "设备拒绝认证，错误码 \(code)"
         case let .randomGenerationFailed(status):
             return "生成认证随机数失败：\(status)"
-        case let .keychain(status):
-            return "访问 macOS 钥匙串失败：\(status)"
+        case let .storage(error):
+            return "访问本地认证密钥失败：\(error.localizedDescription)"
         }
     }
 }
@@ -31,7 +31,7 @@ enum DeskAuthenticationError: LocalizedError {
 final class DeskAuthenticator {
     enum State {
         case idle
-        case helloSent(clientNonce: Data, account: String)
+        case helloSent(clientNonce: Data, account: String, storedKey: Data?)
         case responseSent(account: String, enrollmentKey: Data?)
         case authenticated
     }
@@ -40,6 +40,7 @@ final class DeskAuthenticator {
     private static let enrollmentFlag: UInt8 = 1
     private static let hmacDomain = Data("desk-console-auth-v1".utf8)
     private var state: State = .idle
+    private var cachedKeys: [String: Data] = [:]
 
     var isAuthenticated: Bool {
         if case .authenticated = state {
@@ -54,17 +55,25 @@ final class DeskAuthenticator {
 
     func makeHello(peripheralID: UUID) throws -> Data {
         let account = peripheralID.uuidString
-        let existingKey = try DeskKeychain.load(account: account)
+        let existingKey: Data?
+        if let cachedKey = cachedKeys[account] {
+            existingKey = cachedKey
+        } else {
+            existingKey = try DeskLocalKeyStore.load(account: account)
+            if let existingKey {
+                cachedKeys[account] = existingKey
+            }
+        }
         let clientNonce = try Self.randomData(count: 16)
 
         var payload = Data([Self.payloadVersion, existingKey == nil ? Self.enrollmentFlag : 0])
         payload.append(clientNonce)
-        state = .helloSent(clientNonce: clientNonce, account: account)
+        state = .helloSent(clientNonce: clientNonce, account: account, storedKey: existingKey)
         return payload
     }
 
     func handleChallenge(_ payload: Data) throws -> Data {
-        guard case let .helloSent(clientNonce, account) = state,
+        guard case let .helloSent(clientNonce, account, storedKey) = state,
               payload.count == 26 || payload.count == 58,
               payload[0] == Self.payloadVersion else {
             throw DeskAuthenticationError.invalidChallenge
@@ -78,13 +87,13 @@ final class DeskAuthenticator {
         let deviceNonce = payload.subdata(in: 2..<18)
         let sessionID = payload.subdata(in: 18..<26)
         let enrollmentKey = containsEnrollmentKey ? payload.subdata(in: 26..<58) : nil
-        let storedKey = try DeskKeychain.load(account: account)
         guard let key = enrollmentKey ?? storedKey else {
             throw DeskAuthenticationError.missingSharedKey
         }
 
         if let enrollmentKey {
-            try DeskKeychain.save(enrollmentKey, account: account)
+            try DeskLocalKeyStore.save(enrollmentKey, account: account)
+            cachedKeys[account] = enrollmentKey
         }
 
         var authenticatedData = Self.hmacDomain
@@ -116,7 +125,8 @@ final class DeskAuthenticator {
         }
 
         if enrollmentKey != nil || resultCode == 2 {
-            try? DeskKeychain.delete(account: account)
+            try? DeskLocalKeyStore.delete(account: account)
+            cachedKeys.removeValue(forKey: account)
         }
         state = .idle
         throw DeskAuthenticationError.rejected(resultCode)
@@ -134,61 +144,87 @@ final class DeskAuthenticator {
     }
 }
 
-private enum DeskKeychain {
-    private static let service = "com.dongyu.desk-console-helper.auth"
+private enum DeskLocalKeyStore {
+    private static let directoryName = "com.dongyu.desk-console-helper"
 
     static func load(account: String) throws -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound {
+        do {
+            let url = try keyURL(account: account, createDirectory: false)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return nil
+            }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard data.count == 32 else {
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            try protect(url: url, permissions: 0o600)
+            return data
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
             return nil
+        } catch {
+            throw DeskAuthenticationError.storage(error)
         }
-        guard status == errSecSuccess, let data = item as? Data, data.count == 32 else {
-            throw DeskAuthenticationError.keychain(status)
-        }
-        return data
     }
 
     static func save(_ key: Data, account: String) throws {
         guard key.count == 32 else {
-            throw DeskAuthenticationError.keychain(errSecParam)
+            throw DeskAuthenticationError.storage(
+                CocoaError(.fileWriteInvalidFileName, userInfo: [NSLocalizedDescriptionKey: "认证密钥长度无效"])
+            )
         }
-        try? delete(account: account)
-        /* kSecAttrAccessibleAfterFirstUnlock: readable after first unlock.
-         * NOTE: this item is bound to the code signature of the build that
-         * created it; ad-hoc rebuilds lose access (errSecInteractionNotAllowed
-         * -128). Sign with a stable identity before release, or delete the item
-         * and re-enroll after each rebuild. kSecAttrAccessControl is NOT usable
-         * here: ad-hoc signed apps get errSecMissingEntitlement (-34018). */
-        let item: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecValueData as String: key,
-        ]
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw DeskAuthenticationError.keychain(status)
+        do {
+            let url = try keyURL(account: account, createDirectory: true)
+            // macOS 26 上应用外部启动和重签名后，FileProtection 文件可能持续
+            // 返回 EPERM。目录 0700 + 文件 0600 已限定为当前用户，避免再加
+            // 会导致重启后无法读取的 Data Protection 类别。
+            try key.write(to: url, options: [.atomic])
+            try protect(url: url, permissions: 0o600)
+        } catch {
+            throw DeskAuthenticationError.storage(error)
         }
     }
 
     static func delete(account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw DeskAuthenticationError.keychain(status)
+        do {
+            let url = try keyURL(account: account, createDirectory: false)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        } catch {
+            throw DeskAuthenticationError.storage(error)
         }
+    }
+
+    private static func keyURL(account: String, createDirectory: Bool) throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: createDirectory
+        )
+        let directory = base.appendingPathComponent(directoryName, isDirectory: true)
+        if createDirectory {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try protect(url: directory, permissions: 0o700)
+        }
+        let safeAccount = account.lowercased().filter { $0.isHexDigit || $0 == "-" }
+        guard !safeAccount.isEmpty else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        return directory.appendingPathComponent("auth-\(safeAccount).key", isDirectory: false)
+    }
+
+    private static func protect(url: URL, permissions: Int) throws {
+        try FileManager.default.setAttributes(
+            [.posixPermissions: permissions],
+            ofItemAtPath: url.path
+        )
     }
 }
